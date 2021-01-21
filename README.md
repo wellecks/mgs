@@ -7,6 +7,9 @@ Modeling](https://arxiv.org/pdf/2006.03158.pdf)\
 Sean Welleck, Kyunghyun Cho\
 AAAI 2021
 
+#### Main Logic
+For a quick overview of MGS's main logic, see [this section](https://github.com/wellecks/mgs/blob/main/seq_level/gpt2/guided/train.py#L35-L81) from its training loop.
+
 ## Installation
 
 ```bash
