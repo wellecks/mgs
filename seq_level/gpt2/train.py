@@ -256,16 +256,16 @@ def main():
     parser.add_argument(
         "--dataset-path",
         type=str,
-        default="/path/to/data/wikitext/wikitext-103-raw/wikitext103_raw_gpt2bpe.pkl"
+        default="datasets/wikitext103_raw_gpt2bpe.pkl"
     )
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/path/to/models/transformers_cache"
+        default="../models/tokenizer_cache"
     )
     parser.add_argument(
         "--save-base-dir",
-        default='/path/to/checkpoint/seqlevel/gpt2/',
+        default='./wikipedia103/',
         type=str
     )
     parser.add_argument(

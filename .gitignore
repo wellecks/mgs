@@ -110,3 +110,8 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+
+datasets/*
+mle/*
+gpt2/*
