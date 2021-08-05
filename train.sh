@@ -15,7 +15,14 @@
 
 # 2. Load your environment
 # conda activate torch181
-source ~/envs/mgs/bin/activate
+module load python/3.7
+if [ ! -d ${HOME}/envs/mgs ]; then
+	python -m venv ${HOME}/envs/mgs;
+	source ${HOME}/envs/mgs/bin/activate;
+	python setup.py develop;
+	deactivate;
+fi
+source ${HOME}/envs/mgs/bin/activate
 
 # 3. Copy your dataset on the compute node
 rsync -avz ./datasets/wikitext103_raw_gpt2bpe.pkl $SLURM_TMPDIR
@@ -71,7 +78,10 @@ pkill -f "port ${TPORT}"
 sleep 5
 echo "Running Command:"
 echo "	$cmd"
-tensorboard --logdir ${TMP_RUN_DIR} --port ${TPORT} --host 0.0.0.0 &
+tensorboard --logdir ${TMP_RUN_DIR} --port ${TPORT} --host localhost &
+
+# For Tensorboard port forwarding based on https://josephpcohen.com/w/jupyter-notebook-and-hpc-systems/.
+ssh -N -R ${TPORT}:localhost:${TPORT} login-4 &
 
 $cmd
 
