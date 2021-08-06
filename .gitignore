@@ -115,3 +115,4 @@ ENV/
 datasets/*
 mle/*
 gpt2/*
+*.out 

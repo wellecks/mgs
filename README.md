@@ -61,7 +61,7 @@ python seq_level/gpt2/train.py \
 # MRT
 python seq_level/gpt2/train.py \
   --loss mrt \
-  --ggs-metrc lm \
+  --ggs-metric lm \
   --mrt-normalize-distance 1 \
   --mrt-mle-mix 0.1 \
   --model-load-dir /path/to/mle_model
@@ -89,7 +89,6 @@ python seq_level/gpt2/train.py --mode eval \
   --loss ggs \
   --ggs-metric lm \
 ```
-
 
 #### Preprocess raw wikitext
 *not needed if you download the dataset above
