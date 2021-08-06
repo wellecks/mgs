@@ -163,13 +163,15 @@ def mle_grad(model, inp, target, pad, clip_grad_norm=1.0):
 
 def perturb(
     model, model_with_grad, num_samples, noise, noise_scale,
-    zero_dist_only=False, mle_dist_only=False
+    zero_dist_only=False, mle_dist_only=False, include_mle_gradient=False,
 ):
     models = []
     log_rhos = []
     noise_magnitudes = []  # diagnostic metric
-    n = num_samples
-
+    # If we are including mle_gradients, we will sample num_directions + 1 samples.
+    # The extra sample will correspond to MLE gradient.
+    n = num_samples + 1 if include_mle_gradient else num_samples
+    
     for i in range(n):
         model_ = deepcopy(model)
         noise_mag = 0
@@ -180,7 +182,9 @@ def perturb(
         for param, (name, param_with_grad) in zip(model_.parameters(), model_with_grad.named_parameters()):
             g = -param_with_grad.grad.data
             # Generate the noise
-            if noise_scale == 'uniform':
+            if include_mle_gradient and i == 0:
+                noise_ = 0
+            elif noise_scale == 'uniform':
                 noise_ = noise*torch.randn_like(param.data)*(g.abs().sum()/g.numel())
             else:
                 noise_ = noise*torch.randn_like(param.data)
@@ -188,7 +192,7 @@ def perturb(
             # Choose the mixture component (assume 0.5 mixture proportion)
             if zero_dist_only:
                 epsilon = noise_
-            elif mle_dist_only:
+            elif (include_mle_gradient and i == 0) or mle_dist_only:
                 epsilon = g + noise_
             else:
                 if i % 2 == 0:

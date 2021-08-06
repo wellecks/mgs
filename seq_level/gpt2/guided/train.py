@@ -54,7 +54,8 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                 model, model_with_grad, args.ggs_num_samples, args.ggs_noise,
                 noise_scale=args.noise_scale,
                 zero_dist_only=args.zero_dist_only,
-                mle_dist_only=args.mle_dist_only
+                mle_dist_only=args.mle_dist_only,
+                include_mle_gradient=args.include_mle_gradient,
             )
 
             # -- Decode with perturbed models and compute task metric
@@ -170,4 +171,5 @@ def add_args(parser):
     parser.add_argument(
         "--max-train-steps", type=int, default=-1
     )
+    parser.add_argument('--include-mle-gradient', action='store_true')
     return parser

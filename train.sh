@@ -1,13 +1,10 @@
 #!/bin/bash
 
-#SBATCH --partition=long
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:rtx8000:1
+#SBATCH --gres=gpu:16GB:1
 ##SBATCH --constraint=nvlink
 #SBATCH --mem=32G
 #SBATCH --time=96:00:00
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=arorakus@mila.quebec
 #SBATCH -o ./log/slurm-%j.out
 
 # 1. Load the required modules
@@ -34,8 +31,12 @@ EXP_NAME=${exp_name:="wikipedia103/"}"_${MODEL_NAME}_${LOSS}"
 OUTPUT_DIR_SUFFIX="${MODEL_NAME}_${LOSS}"
 SAVE_BASE_DIR=${save_dir:-"./wikipedia103"}
 
+if [ -d ${SAVE_BASE_DIR} ]; then
+	mkdir -p ${SAVE_BASE_DIR}
+fi 
 
-cmd="python seq_level/gpt2/train.py --dataset-path=$SLURM_TMPDIR/wikitext103_raw_gpt2bpe.pkl --loss ${LOSS}"
+
+cmd="python seq_level/gpt2/train.py --dataset-path=$SLURM_TMPDIR/wikitext103_raw_gpt2bpe.pkl"
 
 if [ ${LOSS} = mle ];
 then
@@ -50,22 +51,23 @@ else
 	then
 		PG_NORMALIZE_DISTANCE=${pg_dist:=1}
 		PG_BASELINE=${baseline:="avg"}
-		cmd+=" --loss pg --pg-normalize-distance=${PG_NORMALIZE_DISTANCE} --pg-mle-mix=${MLE_MIX} --pg-baseline ${PG_BASELINE} "
+		cmd+="  --loss pg --pg-normalize-distance=${PG_NORMALIZE_DISTANCE} --pg-mle-mix=${MLE_MIX} --pg-baseline ${PG_BASELINE} "
 
 	elif [ ${LOSS} = mrt ];
 	then
 		MRT_NORMALIZE_DISTANCE=${mrt_dist:=1}
 		MRT_BASELINE=${baseline:="avg"}
-		cmd+=" --loss pg --mrt-normalize-distance=${MRT_NORMALIZE_DISTANCE} --mrt-mle-mix=${MLE_MIX} "
+		cmd+=" --loss mrt --mrt-normalize-distance=${MRT_NORMALIZE_DISTANCE} --mrt-mle-mix=${MLE_MIX} "
 		
 	elif [ ${LOSS} = ggs ];
 	then
 		MGS_BETA=${mgs_beta:=1.0}
-		cmd+=" --ggs-beta=${MGS_BETA}"
+		cmd+=" --loss ggs --ggs-beta=${MGS_BETA}"
+		
 	elif [ ${LOSS} = ggsimg ];
 	then
 		MGS_BETA=${mgs_beta:=1.0}
-		cmd+=" --ggs-beta=${MGS_BETA} --include_mle_gradient "
+		cmd+=" --loss ggs --ggs-beta=${MGS_BETA} --include_mle_gradient "
 	else
 		echo "Input Is Error."
 	fi
@@ -78,10 +80,12 @@ pkill -f "port ${TPORT}"
 sleep 5
 echo "Running Command:"
 echo "	$cmd"
-tensorboard --logdir ${TMP_RUN_DIR} --port ${TPORT} --host localhost &
 
-# For Tensorboard port forwarding based on https://josephpcohen.com/w/jupyter-notebook-and-hpc-systems/.
-ssh -N -R ${TPORT}:localhost:${TPORT} login-4 &
+if [ -z "${debug}" ]; then
+	tensorboard --logdir ${TMP_RUN_DIR} --port ${TPORT} --host localhost &
+	# For Tensorboard port forwarding based on https://josephpcohen.com/w/jupyter-notebook-and-hpc-systems/.
+	ssh -N -R ${TPORT}:localhost:${TPORT} login-4 &
+fi
 
 $cmd
 
