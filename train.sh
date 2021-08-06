@@ -63,11 +63,11 @@ else
 	then
 		MGS_BETA=${mgs_beta:=1.0}
 		cmd+=" --loss ggs --ggs-beta=${MGS_BETA}"
-		
+
 	elif [ ${LOSS} = ggsimg ];
 	then
 		MGS_BETA=${mgs_beta:=1.0}
-		cmd+=" --loss ggs --ggs-beta=${MGS_BETA} --include_mle_gradient "
+		cmd+=" --loss ggs --ggs-beta=${MGS_BETA} --include-mle-gradient "
 	else
 		echo "Input Is Error."
 	fi
