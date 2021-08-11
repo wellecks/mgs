@@ -9,6 +9,35 @@ import os
 from seq_level.gpt2.guided.metrics import GuidedMetrics
 
 
+def aggregte_scoring_data(batch, model):
+    """ This method does a forward pass over the original model and 
+        the perturbed model to compute the yo_i, the decoded output corresponding
+        to the input x using the original model, and yp_i, the decoding output corresponding
+        to the perturbed model. 
+        The pertubrations are sampled from $\Deta \sim Q_{MGS}$. 
+
+        It returns a set of tuples with each tuple of the form (x_i, y_i, yo_i, yp_i, \Delta).
+    """
+    pass
+
+def train_scoring_function(B, S, R, scoring_opt, scoring_scheduler, c):
+    """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
+        mimic the original cost function (C) by minimizing the L2 loss.
+        $C$ is defined as
+            C(\theta) = 1/|B| \sum_{i=1}^{B} c(y_i, F(x_i, \theta))
+
+        The scoring function optimizes the following equation. 
+            min_{W,b} \sum_{(x_i, y_i, yo_i, yp_i, \Delta_i) in B} || S(x_i, \theta, \Delta; W, b) - (C(\theta) - C(\theta + \Delta))||^2
+            where S(x_i, \theta, \Delta; W, b) = W^T[R(x;\theta) - R(x;\theta+\Delta)] + b
+    """
+    pass
+
+def MGS(batch, scoring_function, model):
+    """ MGS algorithm parameterized to work in original as well as efficient mode 
+    """
+    pass
+
+
 def train(model, tokenizer, dataset_tensor_dict, args, device):
     model.train()
     train_sampler = RandomSampler(dataset_tensor_dict['train'])
@@ -27,7 +56,15 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     score_model = deepcopy(model)
     for epoch_number in range(args.num_train_epochs):
         metrics = GuidedMetrics()
+        # Data Aggregation. 
         for step, batch in enumerate(train_dataloader):
+            # B_ = {(x_i, yt_i, yg_i, yp_i, \Delta) | (x_i, y_i) \in batch} 
+            B_ = aggregate_new_data(batch, model)
+            B = B.add(B_)
+        
+        for (x_i, yt_i, yg_i, yp_i, delta) in B:
+            # Le
+
             batch = batch.squeeze(0)
             assert batch.size(1) >= args.context_length + 1
             inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
