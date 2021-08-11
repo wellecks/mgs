@@ -183,8 +183,9 @@ def perturb(
             g = -param_with_grad.grad.data
             # Generate the noise
             if include_mle_gradient and i == 0:
-                noise_ = 0
-            elif noise_scale == 'uniform':
+                noise = 0
+            
+            if noise_scale == 'uniform':
                 noise_ = noise*torch.randn_like(param.data)*(g.abs().sum()/g.numel())
             else:
                 noise_ = noise*torch.randn_like(param.data)
