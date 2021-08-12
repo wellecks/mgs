@@ -44,7 +44,7 @@ def task_distance(
             if len(predicted_) >= 4:
                 ngs = [ng for ng in ngrams(predicted_, 4)]
                 counter = Counter(ngs)
-                distances.append(1.0 - (1.0*len(counter)/max(len(ngs), 1)))
+                distances.append(1.0 - (1.0 * len(counter) / max(len(ngs), 1)))
             else:
                 distances.append(1.0)
         if average:
@@ -60,7 +60,7 @@ def task_distance(
 
             sequence_mask = (outputs[:, 1:].eq(eos_id).cumsum(1).cumsum(1) <= 1).float()
             # Compute distance
-            distances = -(log_probs*sequence_mask).sum(1)
+            distances = -(log_probs * sequence_mask).sum(1)
             if average:
                 distance = distances.mean().item()
             else:
@@ -74,11 +74,11 @@ def max_length(target, eos_token_id, args):
     target_ = target.tolist()[0]  # longest sequence in the batch
     if eos_token_id in target_[args.context_length:]:
         max_length = int(
-            args.decode_len_multiplier*
-            (target_.index(eos_token_id)+2)
+            args.decode_len_multiplier *
+            (target_.index(eos_token_id) + 2)
         )
     else:
-        max_length = int(args.decode_len_multiplier*(target.size(1) + 2))
+        max_length = int(args.decode_len_multiplier * (target.size(1) + 2))
     max_length = max(1, max_length)
     max_length = min(args.decode_max_length, max_length)
     return max_length
@@ -102,8 +102,9 @@ def decode_and_distance(model, tokenizer, batch, score_model, max_len, device, a
     distance = task_distance(
         target_trim, model_curr_trim, outputs, score_model, args.ggs_metric,
         eos_id=tokenizer.eos_token_id,
+        average=False
     )
-    return bpes, distance
+    return bpes, outputs, distance
 
 
 def trim(decoded, target, context_length, eos_id):
@@ -118,11 +119,11 @@ def trim(decoded, target, context_length, eos_id):
 
     for data_cont, model_cont in zip(cont_target, decoded):
         if eos_id in data_cont:
-            data_cont_ = data_cont[:data_cont.index(eos_id)+1]
+            data_cont_ = data_cont[:data_cont.index(eos_id) + 1]
         else:
             data_cont_ = data_cont
         if eos_id in model_cont:
-            model_cont_= model_cont[:model_cont.index(eos_id)+1]
+            model_cont_ = model_cont[:model_cont.index(eos_id) + 1]
         else:
             model_cont_ = model_cont
         target_trim.append(data_cont_)
@@ -162,8 +163,8 @@ def mle_grad(model, inp, target, pad, clip_grad_norm=1.0):
 
 
 def perturb(
-    model, model_with_grad, num_samples, noise, noise_scale,
-    zero_dist_only=False, mle_dist_only=False, include_mle_gradient=False,
+        model, model_with_grad, num_samples, noise, noise_scale,
+        zero_dist_only=False, mle_dist_only=False, include_mle_gradient=False,
 ):
     models = []
     log_rhos = []
@@ -171,7 +172,7 @@ def perturb(
     # If we are including mle_gradients, we will sample num_directions + 1 samples.
     # The extra sample will correspond to MLE gradient.
     n = num_samples + 1 if include_mle_gradient else num_samples
-    
+
     for i in range(n):
         model_ = deepcopy(model)
         noise_mag = 0
@@ -184,11 +185,11 @@ def perturb(
             # Generate the noise
             if include_mle_gradient and i == 0:
                 noise = 0
-            
+
             if noise_scale == 'uniform':
-                noise_ = noise*torch.randn_like(param.data)*(g.abs().sum()/g.numel())
+                noise_ = noise * torch.randn_like(param.data) * (g.abs().sum() / g.numel())
             else:
-                noise_ = noise*torch.randn_like(param.data)
+                noise_ = noise * torch.randn_like(param.data)
 
             # Choose the mixture component (assume 0.5 mixture proportion)
             if zero_dist_only:
@@ -201,16 +202,16 @@ def perturb(
                 else:
                     epsilon = noise_
 
-            noise_mag += torch.sqrt((noise_**2).sum()).item()
+            noise_mag += torch.sqrt((noise_ ** 2).sum()).item()
 
-            eps_eps += (epsilon.data.view(-1)*epsilon.data.view(-1)).sum()
-            eps_nabla += (g.view(-1)*epsilon.data.view(-1)).sum()
-            nabla_nabla += (g.view(-1)*g.view(-1)).sum()
+            eps_eps += (epsilon.data.view(-1) * epsilon.data.view(-1)).sum()
+            eps_nabla += (g.view(-1) * epsilon.data.view(-1)).sum()
+            nabla_nabla += (g.view(-1) * g.view(-1)).sum()
             param.data = param.data + epsilon
 
         noise_magnitudes.append(noise_mag)
 
-        q = (0.5*torch.exp(-0.5*eps_eps) + 0.5*torch.exp(-0.5*eps_eps + eps_nabla+ - 0.5*nabla_nabla))
+        q = (0.5 * torch.exp(-0.5 * eps_eps) + 0.5 * torch.exp(-0.5 * eps_eps + eps_nabla + - 0.5 * nabla_nabla))
         log_rhos.append(torch.log(q))
         models.append(model_)
     log_rhos = torch.stack(log_rhos).cpu()
@@ -235,7 +236,7 @@ def compute_weight(distance, perturbed_distances, log_rhos, beta):
     qps = [np.exp(-d) for d in perturbed_distances]
     ws = torch.tensor([
         beta * (np.log(qp) - np.log(q))
-     for qp in qps]).clamp(max=1e16)
+        for qp in qps]).clamp(max=1e16)
     ws = ws - log_rhos
     log_ws = torch.log_softmax(ws, 0)
     return log_ws

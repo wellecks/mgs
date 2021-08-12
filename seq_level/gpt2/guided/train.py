@@ -1,5 +1,9 @@
 import torch
 from copy import deepcopy
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from transformers import GPT2Config
 from collections import defaultdict
 from torch.utils.data import DataLoader, RandomSampler
 import seq_level.gpt2.guided.utils as ggs_utils
@@ -20,6 +24,7 @@ def aggregte_scoring_data(batch, model):
     """
     pass
 
+
 def train_scoring_function(B, S, R, scoring_opt, scoring_scheduler, c):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
         mimic the original cost function (C) by minimizing the L2 loss.
@@ -32,11 +37,18 @@ def train_scoring_function(B, S, R, scoring_opt, scoring_scheduler, c):
     """
     pass
 
-def scoring_function(batch, model):
-    """ This methods takes in the batch and the model and 
+
+def scoring_function(batch, cur_model, per_model, phi_network):
+    """ This methods takes in the batch and the model and
          returns the estimated scores for batch input according to the model.
     """
-    pass
+    cur_model.eval()
+    per_model.eval()
+    cur_emb = cur_model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
+    per_emb = per_model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
+    outputs = phi_network(cur_emb - per_emb)
+    return outputs
+
 
 def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, efficient=False):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
@@ -45,12 +57,12 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
 
     # -- Decode with current model (required for computing the 'weights' later).
     max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
-    
+
     decoded = defaultdict(list)
     if efficient:
         distance_curr = scoring_function(batch, model)
     else:
-        bpes_curr, distance_curr = ggs_utils.decode_and_distance(
+        bpes_curr, _, distance_curr = ggs_utils.decode_and_distance(
             model, tokenizer, batch, score_model, max_length, device, args
         )
         for i, idxs in enumerate(bpes_curr):
@@ -79,7 +91,7 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
         if efficient:
             distance = scoring_function(batch, p_model)
         else:
-            bpes_, distance = ggs_utils.decode_and_distance(
+            bpes_, _, distance = ggs_utils.decode_and_distance(
                 p_model, tokenizer, batch, score_model, max_length, device, args
             )
             for i, idxs in enumerate(bpes_):
@@ -87,7 +99,6 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
                     tokenizer.decode(idxs)
                 )
         distances.append(distance)
-
 
     # -- Compute weights
     log_weights = ggs_utils.compute_weight(distance_curr, distances, log_rhos, args.ggs_beta)
@@ -110,6 +121,18 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
 
     return decoded
 
+
+class MLP(nn.Module):
+    def __init__(self, input_size):
+        super(MLP, self).__init__()
+
+        self.fc = nn.Linear(input_size, 1)
+
+    def forward(self, x):
+        output = self.fc(x)
+        return output
+
+
 def train(model, tokenizer, dataset_tensor_dict, args, device):
     model.train()
     train_sampler = RandomSampler(dataset_tensor_dict['train'])
@@ -121,28 +144,131 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
     optimizer, scheduler = utils.get_optimizer(model, len(train_dataloader), args)
 
+    config = GPT2Config()
+    phi_network = MLP(input_size=config.hidden_size).to(device)
+    phi_optimizer = optim.Adam(phi_network.parameters(), lr=0.001)
+
     best_val_loss = 10000
     patience = args.patience
     stats_cache = defaultdict(list)
 
     score_model = deepcopy(model)
+
     for epoch_number in range(args.num_train_epochs):
+
         metrics = GuidedMetrics()
+
+        buffer = []
+        num_docs = 0
+
+        print('=' * 150)
+        print('Data aggregation.\n')
+
+        for step, batch in enumerate(train_dataloader):
+
+            batch = batch.squeeze(0)
+            batch = batch.to(device)
+            assert batch.size(1) >= args.context_length + 1
+
+            inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
+            max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
+
+            model.eval()
+            _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
+                model, tokenizer, batch, score_model, max_length, device, args
+            )
+
+            # Get the current MLE gradients
+            model.train()
+            cur_model = deepcopy(model)
+            model_with_grad, _ = ggs_utils.mle_grad(
+                cur_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
+            )
+
+            per_model = deepcopy(model)
+
+            for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
+
+                gradient = -param_with_grad.grad.data
+
+                if args.noise_scale == 'uniform':
+                    noise_ = args.noise * torch.randn_like(param.data) * (gradient.abs().sum() / gradient.numel())
+                else:
+                    noise_ = args.noise * torch.randn_like(param.data)
+
+                if step % 2 == 0:
+                    epsilon = noise_ + gradient
+                else:
+                    epsilon = noise_
+
+                param.data = param.data + epsilon
+
+            _, per_decodings, per_distances = ggs_utils.decode_and_distance(
+                per_model, tokenizer, batch, score_model, max_length, device, args
+            )
+
+            buffer.append((batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model))
+
+            num_docs += batch.size(0)
+
+            if num_docs > 500:
+                break
+
+        print('=' * 150)
+        print('Start training the score network.\n')
+
+        train_loss = 0.
+        num_docs = 0
+
+        for step, (batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model) in enumerate(buffer):
+
+            model.eval()
+            per_model.eval()
+
+            context_batch = utils.wrap_context_batch(batch, args)
+            context_batch = context_batch.to(batch.device)
+
+            cur_model = deepcopy(model)
+            cur_emb = cur_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
+            per_emb = per_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
+
+            phi_network.train()
+            phi_optimizer.zero_grad()
+
+            outputs = phi_network(cur_emb - per_emb)
+
+            loss = F.mse_loss(
+                outputs,
+                (per_distances - cur_distances).view(-1, 1),
+                reduction='none'
+            )
+            loss = loss.sum()
+
+            loss.backward()
+            phi_optimizer.step()
+
+            train_loss += loss.item()
+            num_docs += batch.size(0)
+
+            if step % 5 == 0 and step > 0:
+                cur_loss = train_loss / num_docs
+                print('Step: %d, Loss: %.2f' % (step, cur_loss))
+
         for step, batch in enumerate(train_dataloader):
             batch = batch.squeeze(0)
             assert batch.size(1) >= args.context_length + 1
 
-            decoded = MGS(batch=batch, 
-                        model=model, 
-                        score_model=score_model, 
-                        tokenizer=tokenizer,
-                        args=args, 
-                        device=device,
-                        metrics=metrics,
-                        optimizer=optimizer,
-                        efficient=False,
-                       )
- 
+            decoded = MGS(batch=batch,
+                          model=model,
+                          score_model=score_model,
+                          tokenizer=tokenizer,
+                          args=args,
+                          device=device,
+                          metrics=metrics,
+                          optimizer=optimizer,
+                          efficient=False,
+                          )
+
             if step % args.print_every == 0:
                 metrics_ = metrics.normalize('train')
                 metrics.reset()
