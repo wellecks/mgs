@@ -38,19 +38,16 @@ def train_scoring_function(B, S, R, scoring_opt, scoring_scheduler, c):
     pass
 
 
-def scoring_function(batch, cur_model, per_model, phi_network):
+def scoring_function(batch, model):
     """ This methods takes in the batch and the model and
          returns the estimated scores for batch input according to the model.
     """
-    cur_model.eval()
-    per_model.eval()
-    cur_emb = cur_model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
-    per_emb = per_model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
-    outputs = phi_network(cur_emb - per_emb)
-    return outputs
+    model.eval()
+    embed = model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
+    return embed
 
 
-def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, efficient=False):
+def MGS(batch, model, phi_network, score_model, tokenizer, args, device, metrics, optimizer, efficient=False):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
     """
     inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
