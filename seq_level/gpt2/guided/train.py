@@ -32,11 +32,83 @@ def train_scoring_function(B, S, R, scoring_opt, scoring_scheduler, c):
     """
     pass
 
-def MGS(batch, scoring_function, model):
-    """ MGS algorithm parameterized to work in original as well as efficient mode 
+def scoring_function(batch, model):
+    """ This methods takes in the batch and the model and 
+         returns the estimated scores for batch input according to the model.
     """
     pass
 
+def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, efficient=False):
+    """ MGS algorithm parameterized to work in original as well as efficient mode.
+    """
+    inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
+
+    # -- Decode with current model (required for computing the 'weights' later).
+    max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
+    
+    decoded = defaultdict(list)
+    if efficient:
+        distance_curr = scoring_function(batch, model)
+    else:
+        bpes_curr, distance_curr = ggs_utils.decode_and_distance(
+            model, tokenizer, batch, score_model, max_length, device, args
+        )
+        for i, idxs in enumerate(bpes_curr):
+            decoded[i].append(
+                tokenizer.decode(idxs)
+            )
+
+    # -- Obtain MLE gradients
+    model_ = deepcopy(model)
+    model_with_grad, mle_loss = ggs_utils.mle_grad(
+        model_, inp, target, tokenizer.pad_token_id, args.max_grad_norm
+    )
+
+    # -- Perturb
+    perturbed_models, log_rhos, noise_magnitudes = ggs_utils.perturb(
+        model, model_with_grad, args.ggs_num_samples, args.ggs_noise,
+        noise_scale=args.noise_scale,
+        zero_dist_only=args.zero_dist_only,
+        mle_dist_only=args.mle_dist_only,
+        include_mle_gradient=args.include_mle_gradient,
+    )
+
+    # -- Decode with perturbed models and compute task metric
+    distances = []
+    for p_model in perturbed_models:
+        if efficient:
+            distance = scoring_function(batch, p_model)
+        else:
+            bpes_, distance = ggs_utils.decode_and_distance(
+                p_model, tokenizer, batch, score_model, max_length, device, args
+            )
+            for i, idxs in enumerate(bpes_):
+                decoded[i].append(
+                    tokenizer.decode(idxs)
+                )
+        distances.append(distance)
+
+
+    # -- Compute weights
+    log_weights = ggs_utils.compute_weight(distance_curr, distances, log_rhos, args.ggs_beta)
+
+    # -- Compute weighted average of the directions
+    update_directions = ggs_utils.parameter_weighted_average(
+        model, perturbed_models, log_weights
+    )
+
+    # -- Perform update
+    ggs_utils.update(model, update_directions, optimizer, args.max_grad_norm)
+
+    # -- Record statistics
+    metrics.step(
+        mle_loss.item(), distance_curr, bpes_curr, target, args.context_length,
+        tokenizer.pad_token_id, tokenizer.eos_token_id,
+        model_with_grad, update_directions, log_rhos, log_weights,
+        noise_magnitudes, distances
+    )
+
+    return decoded
 
 def train(model, tokenizer, dataset_tensor_dict, args, device):
     model.train()
@@ -56,76 +128,21 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     score_model = deepcopy(model)
     for epoch_number in range(args.num_train_epochs):
         metrics = GuidedMetrics()
-        # Data Aggregation. 
         for step, batch in enumerate(train_dataloader):
-            # B_ = {(x_i, yt_i, yg_i, yp_i, \Delta) | (x_i, y_i) \in batch} 
-            B_ = aggregate_new_data(batch, model)
-            B = B.add(B_)
-        
-        for (x_i, yt_i, yg_i, yp_i, delta) in B:
-            # Le
-
             batch = batch.squeeze(0)
             assert batch.size(1) >= args.context_length + 1
-            inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
 
-            # -- Decode with current model (required for computing the 'weights' later).
-            max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
-            bpes_curr, distance_curr = ggs_utils.decode_and_distance(
-                model, tokenizer, batch, score_model, max_length, device, args
-            )
-            decoded = defaultdict(list)
-            for i, idxs in enumerate(bpes_curr):
-                decoded[i].append(
-                    tokenizer.decode(idxs)
-                )
-
-            # -- Obtain MLE gradients
-            model_ = deepcopy(model)
-            model_with_grad, mle_loss = ggs_utils.mle_grad(
-                model_, inp, target, tokenizer.pad_token_id, args.max_grad_norm
-            )
-
-            # -- Perturb
-            perturbed_models, log_rhos, noise_magnitudes = ggs_utils.perturb(
-                model, model_with_grad, args.ggs_num_samples, args.ggs_noise,
-                noise_scale=args.noise_scale,
-                zero_dist_only=args.zero_dist_only,
-                mle_dist_only=args.mle_dist_only,
-                include_mle_gradient=args.include_mle_gradient,
-            )
-
-            # -- Decode with perturbed models and compute task metric
-            distances = []
-            for p_model in perturbed_models:
-                bpes_, distance = ggs_utils.decode_and_distance(
-                    p_model, tokenizer, batch, score_model, max_length, device, args
-                )
-                distances.append(distance)
-                for i, idxs in enumerate(bpes_):
-                    decoded[i].append(
-                        tokenizer.decode(idxs)
-                    )
-
-            # -- Compute weights
-            log_weights = ggs_utils.compute_weight(distance_curr, distances, log_rhos, args.ggs_beta)
-
-            # -- Compute weighted average of the directions
-            update_directions = ggs_utils.parameter_weighted_average(
-                model, perturbed_models, log_weights
-            )
-
-            # -- Perform update
-            ggs_utils.update(model, update_directions, optimizer, args.max_grad_norm)
-
-            # -- Record statistics
-            metrics.step(
-                mle_loss.item(), distance_curr, bpes_curr, target, args.context_length,
-                tokenizer.pad_token_id, tokenizer.eos_token_id,
-                model_with_grad, update_directions, log_rhos, log_weights,
-                noise_magnitudes, distances
-            )
-
+            decoded = MGS(batch=batch, 
+                        model=model, 
+                        score_model=score_model, 
+                        tokenizer=tokenizer,
+                        args=args, 
+                        device=device,
+                        metrics=metrics,
+                        optimizer=optimizer,
+                        efficient=False,
+                       )
+ 
             if step % args.print_every == 0:
                 metrics_ = metrics.normalize('train')
                 metrics.reset()
