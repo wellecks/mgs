@@ -13,28 +13,28 @@ import os
 from seq_level.gpt2.guided.metrics import GuidedMetrics
 
 
-def aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device):
+def aggregate_score_data(train_dataset, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
         the perturbed model to compute the yo_i, the decoded output corresponding
         to the input x using the original model, and yp_i, the decoding output corresponding
         to the perturbed model. 
-        The pertubrations are sampled from $\Deta \sim Q_{MGS}$. 
+        The perturbations are sampled from $\Deta \sim Q_{MGS}$.
 
         It returns a set of tuples with each tuple of the form (x_i, y_i, yo_i, yp_i, \Delta).
     """
-    buffer = []
-    num_docs = 0
 
     print('=' * 150)
     print('Data aggregation.\n')
 
-    for step, batch in enumerate(train_dataloader):
+    buffer = []
+
+    for step, batch in enumerate(train_dataset):
 
         batch = batch.squeeze(0)
         batch = batch.to(device)
         assert batch.size(1) >= args.context_length + 1
 
-        inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
+        inp, target = batch[:, :-1], batch[:, 1:]
         max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
 
         model.eval()
@@ -73,15 +73,10 @@ def aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args
 
         buffer.append((batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model))
 
-        num_docs += batch.size(0)
-
-        if num_docs > 500:
-            break
-
     return buffer
 
 
-def train_score_network(buffer, model, phi_network, phi_optimizer, args):
+def train_score_network(buffers, model, phi_network, phi_optimizer, args):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
         mimic the original cost function (C) by minimizing the L2 loss.
         $C$ is defined as
@@ -91,10 +86,14 @@ def train_score_network(buffer, model, phi_network, phi_optimizer, args):
             min_{W,b} \sum_{(x_i, y_i, yo_i, yp_i, \Delta_i) in B} || S(x_i, \theta, \Delta; W, b) - (C(\theta) - C(\theta + \Delta))||^2
             where S(x_i, \theta, \Delta; W, b) = W^T[R(x;\theta) - R(x;\theta+\Delta)] + b
     """
+
+    print('=' * 150)
+    print('Start training the score network.\n')
+
     train_loss = 0.
     num_docs = 0
 
-    for step, (batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model) in enumerate(buffer):
+    for step, (batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model) in enumerate(buffers):
 
         model.eval()
         per_model.eval()
@@ -102,8 +101,7 @@ def train_score_network(buffer, model, phi_network, phi_optimizer, args):
         context_batch = utils.wrap_context_batch(batch, args)
         context_batch = context_batch.to(batch.device)
 
-        cur_model = deepcopy(model)
-        cur_emb = cur_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
+        cur_emb = model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
         per_emb = per_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
 
         phi_network.train()
@@ -231,6 +229,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         sampler=train_sampler,
         batch_size=1  # batching is handled by the Line Dataset class
     )
+    num_batches = len(train_dataloader) // args.aggregation_size
 
     optimizer, scheduler = utils.get_optimizer(model, len(train_dataloader), args)
 
@@ -248,12 +247,10 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
         metrics = GuidedMetrics()
 
-        buffer = aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device)
-
-        print('=' * 150)
-        print('Start training the score network.\n')
-
-        train_score_network(buffer, model, phi_network, phi_optimizer, args)
+        for idx in range(num_batches):
+            batches = train_dataloader[idx * args.aggregation_size:(idx + 1) * args.aggregation_size]
+            buffers = aggregate_score_data(batches, model, score_model, tokenizer, args, device)
+            train_score_network(buffers, model, phi_network, phi_optimizer, args)
 
         for step, batch in enumerate(train_dataloader):
             batch = batch.squeeze(0)
@@ -354,4 +351,9 @@ def add_args(parser):
         "--max-train-steps", type=int, default=-1
     )
     parser.add_argument('--include-mle-gradient', action='store_true')
+
+    parser.add_argument(
+        "--aggregation_size", type=int, default=100
+    )
+
     return parser
