@@ -31,7 +31,6 @@ def aggregate_score_data(train_dataset, model, score_model, tokenizer, args, cou
     for i in range(count * args.aggregation_size, (count + 1) * args.aggregation_size):
 
         batch = train_dataset[i]
-        batch = batch.squeeze(0)
         batch = batch.to(device)
         assert batch.size(1) >= args.context_length + 1
 
