@@ -13,7 +13,7 @@ import os
 from seq_level.gpt2.guided.metrics import GuidedMetrics
 
 
-def aggregte_scoring_data(batch, model):
+def aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
         the perturbed model to compute the yo_i, the decoded output corresponding
         to the input x using the original model, and yp_i, the decoding output corresponding
@@ -22,10 +22,66 @@ def aggregte_scoring_data(batch, model):
 
         It returns a set of tuples with each tuple of the form (x_i, y_i, yo_i, yp_i, \Delta).
     """
-    pass
+    buffer = []
+    num_docs = 0
+
+    print('=' * 150)
+    print('Data aggregation.\n')
+
+    for step, batch in enumerate(train_dataloader):
+
+        batch = batch.squeeze(0)
+        batch = batch.to(device)
+        assert batch.size(1) >= args.context_length + 1
+
+        inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
+        max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
+
+        model.eval()
+        _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
+            model, tokenizer, batch, score_model, max_length, device, args
+        )
+
+        # Get the current MLE gradients
+        model.train()
+        cur_model = deepcopy(model)
+        model_with_grad, _ = ggs_utils.mle_grad(
+            cur_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
+        )
+
+        per_model = deepcopy(model)
+
+        for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
+
+            gradient = -param_with_grad.grad.data
+
+            if args.noise_scale == 'uniform':
+                noise_ = args.noise * torch.randn_like(param.data) * (gradient.abs().sum() / gradient.numel())
+            else:
+                noise_ = args.noise * torch.randn_like(param.data)
+
+            if step % 2 == 0:
+                epsilon = noise_ + gradient
+            else:
+                epsilon = noise_
+
+            param.data = param.data + epsilon
+
+        _, per_decodings, per_distances = ggs_utils.decode_and_distance(
+            per_model, tokenizer, batch, score_model, max_length, device, args
+        )
+
+        buffer.append((batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model))
+
+        num_docs += batch.size(0)
+
+        if num_docs > 500:
+            break
+
+    return buffer
 
 
-def train_scoring_function(B, S, R, scoring_opt, scoring_scheduler, c):
+def train_score_network(buffer, model, phi_network, phi_optimizer, args):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
         mimic the original cost function (C) by minimizing the L2 loss.
         $C$ is defined as
@@ -35,10 +91,45 @@ def train_scoring_function(B, S, R, scoring_opt, scoring_scheduler, c):
             min_{W,b} \sum_{(x_i, y_i, yo_i, yp_i, \Delta_i) in B} || S(x_i, \theta, \Delta; W, b) - (C(\theta) - C(\theta + \Delta))||^2
             where S(x_i, \theta, \Delta; W, b) = W^T[R(x;\theta) - R(x;\theta+\Delta)] + b
     """
-    pass
+    train_loss = 0.
+    num_docs = 0
+
+    for step, (batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model) in enumerate(buffer):
+
+        model.eval()
+        per_model.eval()
+
+        context_batch = utils.wrap_context_batch(batch, args)
+        context_batch = context_batch.to(batch.device)
+
+        cur_model = deepcopy(model)
+        cur_emb = cur_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
+        per_emb = per_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
+
+        phi_network.train()
+        phi_optimizer.zero_grad()
+
+        outputs = phi_network(cur_emb - per_emb)
+
+        loss = F.mse_loss(
+            outputs,
+            (per_distances - cur_distances).view(-1, 1),
+            reduction='none'
+        )
+        loss = loss.sum()
+
+        loss.backward()
+        phi_optimizer.step()
+
+        train_loss += loss.item()
+        num_docs += batch.size(0)
+
+        if step % 5 == 0 and step > 0:
+            cur_loss = train_loss / num_docs
+            print('Step: %d, Loss: %.2f' % (step, cur_loss))
 
 
-def scoring_function(batch, model):
+def score_function(batch, model):
     """ This methods takes in the batch and the model and
          returns the estimated scores for batch input according to the model.
     """
@@ -47,7 +138,7 @@ def scoring_function(batch, model):
     return embed
 
 
-def MGS(batch, model, phi_network, score_model, tokenizer, args, device, metrics, optimizer, efficient=False):
+def MGS(batch, model, score_model, phi_network, tokenizer, args, device, metrics, optimizer, efficient=False):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
     """
     inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
@@ -57,7 +148,7 @@ def MGS(batch, model, phi_network, score_model, tokenizer, args, device, metrics
 
     decoded = defaultdict(list)
     if efficient:
-        distance_curr = scoring_function(batch, model)
+        distance_curr = score_function(batch, model)
     else:
         bpes_curr, _, distance_curr = ggs_utils.decode_and_distance(
             model, tokenizer, batch, score_model, max_length, device, args
@@ -86,7 +177,7 @@ def MGS(batch, model, phi_network, score_model, tokenizer, args, device, metrics
     distances = []
     for p_model in perturbed_models:
         if efficient:
-            distance = scoring_function(batch, p_model)
+            distance = score_function(batch, p_model)
         else:
             bpes_, _, distance = ggs_utils.decode_and_distance(
                 p_model, tokenizer, batch, score_model, max_length, device, args
@@ -98,6 +189,8 @@ def MGS(batch, model, phi_network, score_model, tokenizer, args, device, metrics
         distances.append(distance)
 
     # -- Compute weights
+    # Kushal: please revise phi_network(distance_curr - distances), where the score_function's output is embedding.
+
     log_weights = ggs_utils.compute_weight(distance_curr, distances, log_rhos, args.ggs_beta)
 
     # -- Compute weighted average of the directions
@@ -155,101 +248,12 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
         metrics = GuidedMetrics()
 
-        buffer = []
-        num_docs = 0
-
-        print('=' * 150)
-        print('Data aggregation.\n')
-
-        for step, batch in enumerate(train_dataloader):
-
-            batch = batch.squeeze(0)
-            batch = batch.to(device)
-            assert batch.size(1) >= args.context_length + 1
-
-            inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
-            max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
-
-            model.eval()
-            _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
-                model, tokenizer, batch, score_model, max_length, device, args
-            )
-
-            # Get the current MLE gradients
-            model.train()
-            cur_model = deepcopy(model)
-            model_with_grad, _ = ggs_utils.mle_grad(
-                cur_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
-            )
-
-            per_model = deepcopy(model)
-
-            for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
-
-                gradient = -param_with_grad.grad.data
-
-                if args.noise_scale == 'uniform':
-                    noise_ = args.noise * torch.randn_like(param.data) * (gradient.abs().sum() / gradient.numel())
-                else:
-                    noise_ = args.noise * torch.randn_like(param.data)
-
-                if step % 2 == 0:
-                    epsilon = noise_ + gradient
-                else:
-                    epsilon = noise_
-
-                param.data = param.data + epsilon
-
-            _, per_decodings, per_distances = ggs_utils.decode_and_distance(
-                per_model, tokenizer, batch, score_model, max_length, device, args
-            )
-
-            buffer.append((batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model))
-
-            num_docs += batch.size(0)
-
-            if num_docs > 500:
-                break
+        buffer = aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device)
 
         print('=' * 150)
         print('Start training the score network.\n')
 
-        train_loss = 0.
-        num_docs = 0
-
-        for step, (batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model) in enumerate(buffer):
-
-            model.eval()
-            per_model.eval()
-
-            context_batch = utils.wrap_context_batch(batch, args)
-            context_batch = context_batch.to(batch.device)
-
-            cur_model = deepcopy(model)
-            cur_emb = cur_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
-            per_emb = per_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
-
-            phi_network.train()
-            phi_optimizer.zero_grad()
-
-            outputs = phi_network(cur_emb - per_emb)
-
-            loss = F.mse_loss(
-                outputs,
-                (per_distances - cur_distances).view(-1, 1),
-                reduction='none'
-            )
-            loss = loss.sum()
-
-            loss.backward()
-            phi_optimizer.step()
-
-            train_loss += loss.item()
-            num_docs += batch.size(0)
-
-            if step % 5 == 0 and step > 0:
-                cur_loss = train_loss / num_docs
-                print('Step: %d, Loss: %.2f' % (step, cur_loss))
+        train_score_network(buffer, model, phi_network, phi_optimizer, args)
 
         for step, batch in enumerate(train_dataloader):
             batch = batch.squeeze(0)
@@ -258,12 +262,13 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
             decoded = MGS(batch=batch,
                           model=model,
                           score_model=score_model,
+                          phi_network=phi_network,
                           tokenizer=tokenizer,
                           args=args,
                           device=device,
                           metrics=metrics,
                           optimizer=optimizer,
-                          efficient=False,
+                          efficient=False
                           )
 
             if step % args.print_every == 0:
