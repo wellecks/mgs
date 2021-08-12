@@ -13,7 +13,7 @@ import os
 from seq_level.gpt2.guided.metrics import GuidedMetrics
 
 
-def aggregate_score_data(train_dataset, model, score_model, tokenizer, args, count, device):
+def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
         the perturbed model to compute the yo_i, the decoded output corresponding
         to the input x using the original model, and yp_i, the decoding output corresponding
@@ -28,9 +28,12 @@ def aggregate_score_data(train_dataset, model, score_model, tokenizer, args, cou
 
     buffer = []
 
-    for i in range(count * args.aggregation_size, (count + 1) * args.aggregation_size):
+    for step, batch in enumerate(train_dataloader):
 
-        batch = train_dataset[i]
+        if step > args.aggregation_size:
+            break
+
+        batch = batch.squeeze(0)
         batch = batch.to(device)
         assert batch.size(1) >= args.context_length + 1
 
@@ -60,7 +63,7 @@ def aggregate_score_data(train_dataset, model, score_model, tokenizer, args, cou
             else:
                 noise_ = args.noise * torch.randn_like(param.data)
 
-            if i % 2 == 0:
+            if step % 2 == 0:
                 epsilon = noise_ + gradient
             else:
                 epsilon = noise_
@@ -239,7 +242,6 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     best_val_loss = 10000
     patience = args.patience
     stats_cache = defaultdict(list)
-    count = 0
 
     score_model = deepcopy(model)
 
@@ -247,13 +249,13 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
         metrics = GuidedMetrics()
 
-        buffers = aggregate_score_data(dataset_tensor_dict['train'], model, score_model, tokenizer, args, count, device)
+        buffers = aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device)
         train_score_network(buffers, model, phi_network, phi_optimizer, args)
-        count += 1
 
         for step, batch in enumerate(train_dataloader):
 
             batch = batch.squeeze(0)
+            batch = batch.to(device)
             assert batch.size(1) >= args.context_length + 1
 
             decoded = MGS(batch=batch,
