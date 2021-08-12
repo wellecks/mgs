@@ -138,6 +138,19 @@ def score_function(batch, model):
     embed = model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
     return embed
 
+def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args):
+    bpes_curr, distance_curr = ggs_utils.decode_and_distance(
+            model, tokenizer, batch, score_model, max_length, device, args
+        )
+        for i, idxs in enumerate(bpes_curr):
+            decoded[i].append(
+                tokenizer.decode(idxs)
+            )
+    return distance_curr, decoded
+
+
+
+
 
 def MGS(batch, model, score_model, phi_network, tokenizer, args, device, metrics, optimizer, efficient=False):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
