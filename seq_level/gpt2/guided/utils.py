@@ -84,7 +84,7 @@ def max_length(target, eos_token_id, args):
     return max_length
 
 
-def decode_and_distance(model, tokenizer, batch, score_model, max_len, device, args):
+def decode_and_distance(model, tokenizer, batch, score_model, max_len, device, args, average_distance=True):
     model.eval()
     _, _, bpes, texts, outputs = generate_batch(
         model, tokenizer, batch, args.context_length, device,
@@ -102,7 +102,7 @@ def decode_and_distance(model, tokenizer, batch, score_model, max_len, device, a
     distance = task_distance(
         target_trim, model_curr_trim, outputs, score_model, args.ggs_metric,
         eos_id=tokenizer.eos_token_id,
-        average=False
+        average=average_distance,
     )
     return bpes, outputs, distance
 

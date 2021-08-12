@@ -11,6 +11,7 @@ import seq_level.gpt2.utils as utils
 import seq_level.gpt2.train as train_utils
 import os
 from seq_level.gpt2.guided.metrics import GuidedMetrics
+from functools import partial
 
 
 def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device):
@@ -42,7 +43,7 @@ def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, 
 
         model.eval()
         _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
-            model, tokenizer, batch, score_model, max_length, device, args
+            model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
         )
 
         # Get the current MLE gradients
@@ -71,7 +72,7 @@ def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, 
             param.data = param.data + epsilon
 
         _, per_decodings, per_distances = ggs_utils.decode_and_distance(
-            per_model, tokenizer, batch, score_model, max_length, device, args
+            per_model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
         )
 
         buffer.append((batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model))
@@ -129,30 +130,26 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, args):
             cur_loss = train_loss / num_docs
             print('Step: %d, Loss: %.2f' % (step, cur_loss))
 
-
-def score_function(batch, model):
+def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args, prefix):
+    decoded = defaultdict(list)
+    bpes_curr, outputs, distance_curr = ggs_utils.decode_and_distance(
+            model, tokenizer, batch, score_model, max_length, device, args)
+    for i, idxs in enumerate(bpes_curr):
+        decoded[f'{prefix}_{i}'].append(tokenizer.decode(idxs))
+    return distance_curr, bpes_curr, decoded
+    
+def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_model, max_length, device, args, prefix):
     """ This methods takes in the batch and the model and
          returns the estimated scores for batch input according to the model.
     """
+    outputs = torch.tensor([])
+    decoded = defaultdict(list)
     model.eval()
     embed = model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
-    return embed
-
-def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args):
-    bpes_curr, distance_curr = ggs_utils.decode_and_distance(
-            model, tokenizer, batch, score_model, max_length, device, args
-        )
-        for i, idxs in enumerate(bpes_curr):
-            decoded[i].append(
-                tokenizer.decode(idxs)
-            )
-    return distance_curr, decoded
+    return embed, outputs, decoded
 
 
-
-
-
-def MGS(batch, model, score_model, phi_network, tokenizer, args, device, metrics, optimizer, efficient=False):
+def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, scoring_function=original_mgs_scoring_function):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
     """
     inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
@@ -161,16 +158,9 @@ def MGS(batch, model, score_model, phi_network, tokenizer, args, device, metrics
     max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
 
     decoded = defaultdict(list)
-    if efficient:
-        distance_curr = score_function(batch, model)
-    else:
-        bpes_curr, _, distance_curr = ggs_utils.decode_and_distance(
-            model, tokenizer, batch, score_model, max_length, device, args
-        )
-        for i, idxs in enumerate(bpes_curr):
-            decoded[i].append(
-                tokenizer.decode(idxs)
-            )
+    distance_curr, bpes_curr, decoded_samples = scoring_function(model, tokenizer, batch, score_model, 
+                                                                    max_length, device, args, prefix='original')
+    decoded.update(decoded_samples)
 
     # -- Obtain MLE gradients
     model_ = deepcopy(model)
@@ -189,18 +179,11 @@ def MGS(batch, model, score_model, phi_network, tokenizer, args, device, metrics
 
     # -- Decode with perturbed models and compute task metric
     distances = []
-    for p_model in perturbed_models:
-        if efficient:
-            distance = score_function(batch, p_model)
-        else:
-            bpes_, _, distance = ggs_utils.decode_and_distance(
-                p_model, tokenizer, batch, score_model, max_length, device, args
-            )
-            for i, idxs in enumerate(bpes_):
-                decoded[i].append(
-                    tokenizer.decode(idxs)
-                )
+    for i, p_model in enumerate(perturbed_models):
+        distance, _, decoded_samples  = scoring_function(p_model, tokenizer, batch, score_model, 
+                                                                    max_length, device, args, prefix=f'preturb_{i}')
         distances.append(distance)
+        decoded.update(decoded_samples)
 
     # -- Compute weights
     # Kushal: please revise phi_network(distance_curr - distances), where the score_function's output is embedding.
@@ -248,22 +231,29 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
     optimizer, scheduler = utils.get_optimizer(model, len(train_dataloader), args)
 
-    config = GPT2Config()
-    phi_network = MLP(input_size=config.hidden_size).to(device)
-    phi_optimizer = optim.Adam(phi_network.parameters(), lr=0.001)
+    if args.efficient:
+        config = GPT2Config()
+        phi_network = MLP(input_size=config.hidden_size).to(device)
+        phi_optimizer = optim.Adam(phi_network.parameters(), lr=0.001)
+        scoring_function=partial(dagger_mgs_scoring_function, phi_network=phi_network)
+    else:
+        scoring_function=original_mgs_scoring_function
 
     best_val_loss = 10000
     patience = args.patience
     stats_cache = defaultdict(list)
 
     score_model = deepcopy(model)
-
     for epoch_number in range(args.num_train_epochs):
-
         metrics = GuidedMetrics()
 
-        buffers = aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device)
-        train_score_network(buffers, model, phi_network, phi_optimizer, args)
+        if args.efficient:
+            buffers = aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device)
+
+            print('=' * 150)
+            print('Start training the score network.\n')
+
+            train_score_network(buffers, model, phi_network, phi_optimizer, args)
 
         for step, batch in enumerate(train_dataloader):
 
@@ -274,14 +264,13 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
             decoded = MGS(batch=batch,
                           model=model,
                           score_model=score_model,
-                          phi_network=phi_network,
                           tokenizer=tokenizer,
                           args=args,
                           device=device,
                           metrics=metrics,
                           optimizer=optimizer,
-                          efficient=False
-                          )
+                          scoring_function=scoring_function,
+                         )
 
             if step % args.print_every == 0:
                 metrics_ = metrics.normalize('train')
@@ -370,5 +359,6 @@ def add_args(parser):
     parser.add_argument(
         "--aggregation_size", type=int, default=100
     )
+    parser.add_argument('--efficient', action='store_true')
 
     return parser
