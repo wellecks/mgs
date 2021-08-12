@@ -13,7 +13,7 @@ import os
 from seq_level.gpt2.guided.metrics import GuidedMetrics
 
 
-def aggregate_score_data(train_dataset, model, score_model, tokenizer, args, device):
+def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
         the perturbed model to compute the yo_i, the decoded output corresponding
         to the input x using the original model, and yp_i, the decoding output corresponding
@@ -28,7 +28,10 @@ def aggregate_score_data(train_dataset, model, score_model, tokenizer, args, dev
 
     buffer = []
 
-    for step, batch in enumerate(train_dataset):
+    for step, batch in enumerate(train_dataloader):
+
+        if step > args.aggregation_size:
+            break
 
         batch = batch.squeeze(0)
         batch = batch.to(device)
@@ -227,9 +230,8 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     train_dataloader = DataLoader(
         dataset_tensor_dict['train'],
         sampler=train_sampler,
-        batch_size=1  # batching is handled by the Line Dataset class
+        batch_size=1
     )
-    num_batches = len(train_dataloader) // args.aggregation_size
 
     optimizer, scheduler = utils.get_optimizer(model, len(train_dataloader), args)
 
@@ -247,12 +249,11 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
         metrics = GuidedMetrics()
 
-        for idx in range(num_batches):
-            batches = train_dataloader[idx * args.aggregation_size:(idx + 1) * args.aggregation_size]
-            buffers = aggregate_score_data(batches, model, score_model, tokenizer, args, device)
-            train_score_network(buffers, model, phi_network, phi_optimizer, args)
+        buffers = aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device)
+        train_score_network(buffers, model, phi_network, phi_optimizer, args)
 
         for step, batch in enumerate(train_dataloader):
+
             batch = batch.squeeze(0)
             assert batch.size(1) >= args.context_length + 1
 
