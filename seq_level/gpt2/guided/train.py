@@ -10,9 +10,62 @@ import seq_level.gpt2.guided.utils as ggs_utils
 import seq_level.gpt2.utils as utils
 import seq_level.gpt2.train as train_utils
 import os
-from seq_level.gpt2.guided.metrics import GuidedMetrics
 from functools import partial
+from seq_level.gpt2.guided.metrics import GuidedMetrics
 
+from timeit import default_timer as timer
+import pandas as pd
+
+total_scoring_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+curr_scoring_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+mle_grad_computation_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+perturb_computation_time = {
+    "cuml" : 0,
+    "tick": 0,
+    'num_perturb': 0,
+}
+
+perturb_scoring_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+weight_computation_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+ggs_update_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+metrics_update_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+total_mgs_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
+
+total_train_step_time = {
+    "cuml" : 0,
+    "tick": 0,
+}
 
 def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
@@ -152,22 +205,37 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
 def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, scoring_function=original_mgs_scoring_function):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
     """
+    mgs_time_start = timer()
+
     inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
 
     # -- Decode with current model (required for computing the 'weights' later).
     max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
 
     decoded = defaultdict(list)
+
+    curr_scoring_start = timer()
     distance_curr, bpes_curr, decoded_samples = scoring_function(model, tokenizer, batch, score_model, 
                                                                     max_length, device, args, prefix='original')
     decoded.update(decoded_samples)
+    curr_scoring_end = timer()
+    curr_scoring_time['cuml'] += curr_scoring_end - curr_scoring_start
+    curr_scoring_time['tick'] += 1
+
+    total_scoring_time['cuml'] += curr_scoring_end - curr_scoring_start
+    total_scoring_time['tick'] += 1
 
     # -- Obtain MLE gradients
+    mle_grad_computation_start = timer()
     model_ = deepcopy(model)
     model_with_grad, mle_loss = ggs_utils.mle_grad(
         model_, inp, target, tokenizer.pad_token_id, args.max_grad_norm
     )
+    mle_grad_computation_end = timer()
+    mle_grad_computation_time['cuml'] += mle_grad_computation_end - mle_grad_computation_start
+    mle_grad_computation_time['tick'] += 1
 
+    perturb_computation_start = timer()
     # -- Perturb
     perturbed_models, log_rhos, noise_magnitudes = ggs_utils.perturb(
         model, model_with_grad, args.ggs_num_samples, args.ggs_noise,
@@ -176,7 +244,11 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
         mle_dist_only=args.mle_dist_only,
         include_mle_gradient=args.include_mle_gradient,
     )
+    perturb_computation_end = timer()
+    perturb_computation_time['cuml'] += perturb_computation_end - perturb_computation_start
+    perturb_computation_time['tick'] += 1
 
+    perturb_scoring_start = timer()
     # -- Decode with perturbed models and compute task metric
     distances = []
     for i, p_model in enumerate(perturbed_models):
@@ -184,20 +256,33 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
                                                                     max_length, device, args, prefix=f'preturb_{i}')
         distances.append(distance)
         decoded.update(decoded_samples)
+    perturb_scoring_end = timer()
+    perturb_scoring_time['cuml'] += perturb_scoring_end - perturb_scoring_start
+    total_scoring_time['cuml'] += perturb_scoring_end - perturb_scoring_start
+    perturb_scoring_time['tick'] += 1
 
     # -- Compute weights
     # Kushal: please revise phi_network(distance_curr - distances), where the score_function's output is embedding.
 
+    weight_computation_start = timer()
     log_weights = ggs_utils.compute_weight(distance_curr, distances, log_rhos, args.ggs_beta)
 
     # -- Compute weighted average of the directions
     update_directions = ggs_utils.parameter_weighted_average(
         model, perturbed_models, log_weights
     )
+    weight_computation_end = timer()
+    weight_computation_time['cuml'] += weight_computation_end - weight_computation_start
+    weight_computation_time['tick'] += 1
 
+    ggs_update_start = timer()
     # -- Perform update
     ggs_utils.update(model, update_directions, optimizer, args.max_grad_norm)
+    ggs_update_end = timer()
+    ggs_update_time['cuml'] += ggs_update_end - ggs_update_start
+    ggs_update_time['tick'] += 1
 
+    metrics_update_start = timer()
     # -- Record statistics
     metrics.step(
         mle_loss.item(), distance_curr, bpes_curr, target, args.context_length,
@@ -205,7 +290,13 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
         model_with_grad, update_directions, log_rhos, log_weights,
         noise_magnitudes, distances
     )
+    metrics_update_end = timer()
+    metrics_update_time['cuml'] += metrics_update_end - metrics_update_start
+    metrics_update_time['tick'] += 1
 
+    mgs_time_end = timer()
+    total_mgs_time['cuml'] += mgs_time_end - mgs_time_start
+    total_mgs_time['tick'] += 1
     return decoded
 
 
@@ -242,6 +333,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     best_val_loss = 10000
     patience = args.patience
     stats_cache = defaultdict(list)
+    average_times = {}
 
     score_model = deepcopy(model)
     for epoch_number in range(args.num_train_epochs):
@@ -257,6 +349,8 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
         for step, batch in enumerate(train_dataloader):
 
+            train_step_time_start = timer()
+
             batch = batch.squeeze(0)
             batch = batch.to(device)
             assert batch.size(1) >= args.context_length + 1
@@ -271,6 +365,10 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                           optimizer=optimizer,
                           scoring_function=scoring_function,
                          )
+            train_step_time_end = timer()
+
+            total_train_step_time['cuml'] += train_step_time_end - train_step_time_start
+            total_train_step_time['tick'] += 1
 
             if step % args.print_every == 0:
                 metrics_ = metrics.normalize('train')
@@ -287,6 +385,23 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                 utils.log_tensorboard(metrics_, args.log_step)
                 stats_cache['train/mle_loss'].append(metrics_['train/mle_loss'])
                 stats_cache['train/distance'].append(metrics_['train/distance'])
+
+                average_times['total_scoring_time'] = total_scoring_time['cuml']/total_scoring_time['tick']
+                average_times['curr_scoring_time'] = curr_scoring_time['cuml']/curr_scoring_time['tick']
+                average_times['mle_grad_computation_time'] = mle_grad_computation_time['cuml']/mle_grad_computation_time['tick']
+                average_times['perturb_computation_time'] = perturb_computation_time['cuml']/perturb_computation_time['tick']
+                average_times['perturb_scoring_time'] = perturb_scoring_time['cuml']/perturb_scoring_time['tick']
+                average_times['weight_computation_time'] = weight_computation_time['cuml']/weight_computation_time['tick']
+                average_times['ggs_update_time'] = ggs_update_time['cuml']/ggs_update_time['tick']
+                average_times['metrics_update_time'] = metrics_update_time['cuml']/metrics_update_time['tick']
+                average_times['total_mgs_time'] = total_mgs_time['cuml']/total_mgs_time['tick']
+                average_times['total_train_step_time'] = total_train_step_time['cuml']/total_train_step_time['tick']
+
+                if args.plot_times:
+                    df = pd.DataFrame.from_dict(average_times, 
+                                                orient='index', 
+                                                columns=['avg. time'])
+                    print(df)
 
             if args.log_step % args.valid_every == 0 or step == 0:
                 val_loss, val_metrics, decodings = train_utils.valid_iteration(
@@ -360,5 +475,7 @@ def add_args(parser):
         "--aggregation_size", type=int, default=100
     )
     parser.add_argument('--efficient', action='store_true')
+    
+    parser.add_argument('--plot-times', action='store_true')
 
     return parser
