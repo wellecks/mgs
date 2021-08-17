@@ -16,58 +16,60 @@ from seq_level.gpt2.guided.metrics import GuidedMetrics
 from timeit import default_timer as timer
 import pandas as pd
 
+
 total_scoring_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 curr_scoring_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 mle_grad_computation_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 perturb_computation_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
     'num_perturb': 0,
 }
 
 perturb_scoring_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 weight_computation_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 ggs_update_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 metrics_update_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 total_mgs_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
 total_train_step_time = {
-    "cuml" : 0,
+    "cuml": 0,
     "tick": 0,
 }
 
-def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, device):
+
+def aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
         the perturbed model to compute the yo_i, the decoded output corresponding
         to the input x using the original model, and yp_i, the decoding output corresponding
@@ -133,7 +135,7 @@ def aggregate_score_data(train_dataloader, model, score_model, tokenizer, args, 
     return buffer
 
 
-def train_score_network(buffers, model, phi_network, phi_optimizer, args):
+def train_scoring_network(buffers, model, phi_network, phi_optimizer, args):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
         mimic the original cost function (C) by minimizing the L2 loss.
         $C$ is defined as
@@ -183,14 +185,17 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, args):
             cur_loss = train_loss / num_docs
             print('Step: %d, Loss: %.2f' % (step, cur_loss))
 
+
 def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args, prefix):
     decoded = defaultdict(list)
     bpes_curr, outputs, distance_curr = ggs_utils.decode_and_distance(
-            model, tokenizer, batch, score_model, max_length, device, args)
+            model, tokenizer, batch, score_model, max_length, device, args
+    )
     for i, idxs in enumerate(bpes_curr):
         decoded[f'{prefix}_{i}'].append(tokenizer.decode(idxs))
     return distance_curr, bpes_curr, decoded
-    
+
+
 def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_model, max_length, device, args, prefix):
     """ This methods takes in the batch and the model and
          returns the estimated scores for batch input according to the model.
@@ -215,8 +220,9 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
     decoded = defaultdict(list)
 
     curr_scoring_start = timer()
-    distance_curr, bpes_curr, decoded_samples = scoring_function(model, tokenizer, batch, score_model, 
-                                                                    max_length, device, args, prefix='original')
+    distance_curr, bpes_curr, decoded_samples = scoring_function(
+        model, tokenizer, batch, score_model, max_length, device, args, prefix='original'
+    )
     decoded.update(decoded_samples)
     curr_scoring_end = timer()
     curr_scoring_time['cuml'] += curr_scoring_end - curr_scoring_start
@@ -252,8 +258,9 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
     # -- Decode with perturbed models and compute task metric
     distances = []
     for i, p_model in enumerate(perturbed_models):
-        distance, _, decoded_samples  = scoring_function(p_model, tokenizer, batch, score_model, 
-                                                                    max_length, device, args, prefix=f'preturb_{i}')
+        distance, _, decoded_samples = scoring_function(
+            p_model, tokenizer, batch, score_model, max_length, device, args, prefix=f'preturb_{i}'
+        )
         distances.append(distance)
         decoded.update(decoded_samples)
     perturb_scoring_end = timer()
@@ -326,9 +333,11 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         config = GPT2Config()
         phi_network = MLP(input_size=config.hidden_size).to(device)
         phi_optimizer = optim.Adam(phi_network.parameters(), lr=0.001)
-        scoring_function=partial(dagger_mgs_scoring_function, phi_network=phi_network)
+        scoring_function = partial(dagger_mgs_scoring_function, phi_network=phi_network)
     else:
-        scoring_function=original_mgs_scoring_function
+        scoring_function = original_mgs_scoring_function
+        phi_network = None
+        phi_optimizer = None
 
     best_val_loss = 10000
     patience = args.patience
@@ -345,7 +354,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
             print('=' * 150)
             print('Start training the score network.\n')
 
-            train_score_network(buffers, model, phi_network, phi_optimizer, args)
+            train_scoring_network(buffers, model, phi_network, phi_optimizer, args)
 
         for step, batch in enumerate(train_dataloader):
 
