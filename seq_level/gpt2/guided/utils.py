@@ -232,11 +232,10 @@ def parameter_weighted_average(model, perturbed_models, log_weights):
 
 
 def compute_weight(distance, perturbed_distances, log_rhos, beta):
-    q = np.exp(-distance)
-    qps = [np.exp(-d) for d in perturbed_distances]
     ws = torch.tensor([
-        beta * (np.log(qp) - np.log(q))
-        for qp in qps]).clamp(max=1e16)
+            beta * (distance - perturbed_distance)
+                for perturbed_distance in perturbed_distances])\
+            .clamp(max=1e16)
     ws = ws - log_rhos
     log_ws = torch.log_softmax(ws, 0)
     return log_ws
