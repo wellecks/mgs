@@ -64,10 +64,19 @@ else
 		MGS_BETA=${mgs_beta:=1.0}
 		cmd+=" --loss ggs --ggs-beta=${MGS_BETA}"
 
-	elif [ ${LOSS} = ggsimg ];
-	then
-		MGS_BETA=${mgs_beta:=1.0}
-		cmd+=" --loss ggs --ggs-beta=${MGS_BETA} --include-mle-gradient "
+        if [ -n "${include_mle_grad}" ];
+        then
+            cmd+=" --include-mle-gradient "
+        fi
+
+        if [ -n "${efficient}" ]; 
+        then
+            cmd+=" --efficient "
+						if [ -n "${debug}" ];
+						then
+							cmd+='--score-network-epochs 1 --initial-train-data-size 5'
+						fi
+        fi
 	else
 		echo "Input Is Error."
 	fi

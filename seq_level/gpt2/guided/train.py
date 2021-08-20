@@ -15,6 +15,85 @@ from seq_level.gpt2.guided.metrics import GuidedMetrics
 
 from timeit import default_timer as timer
 import pandas as pd
+import collections
+import random
+import shelve
+import hashlib
+import pickle
+
+class RingBuffer:
+    def __init__(self, max_size=1000, persistence='none', persistent_file_path=None):
+        self.max_size = max_size
+        self.persistence = persistence
+        self.queue = []
+
+        if persistence == 'none':
+            self.db = {}
+        elif persistence == 'shelve':
+            self.db = shelve.open(persistent_file_path)
+        self.db_counter = {}
+    def __len__(self):
+        return len(self.queue)
+
+    def append(self, idx, type, batch, model, 
+                sequences, distances):
+        if len(self.queue) > self.max_size:
+            (_, _, old_model_key, old_sequences_key, 
+                old_batch_key, old_distance_key) = self.queue.pop(0)
+            
+            self.db_counter[old_model_key] -= 1
+            if self.db_counter[old_model_key] == 0:
+                del self.db_counter[old_model_key]
+                del self.db[old_model_key]
+
+            self.db_counter[old_batch_key] -= 1
+            if self.db_counter[old_batch_key] == 0:
+                del self.db_counter[old_batch_key]
+                del self.db[old_batch_key]
+
+            self.db_counter[old_sequences_key] -= 1
+            if self.db_counter[old_sequences_key] == 0:
+                del self.db_counter[old_sequences_key]
+                del self.db[old_sequences_key]
+
+        batch_key = f"batch_{batch.__hash__()}"
+        if batch_key not in self.db:
+            self.db[batch_key] = batch.cpu()
+            self.db_counter[batch_key] = 0
+        self.db_counter[batch_key] += 1
+
+        model_key = f"model_{type}_{model.__hash__()}"
+        if model_key not in self.db:
+            self.db[model_key] = model.cpu()
+            self.db_counter[model_key] = 0
+        self.db_counter[model_key] += 1
+
+        sequences_key_suffix = str(sequences.__hash__())
+        sequences_key = f"sequence_{batch_key}_{model_key}_{sequences_key_suffix}"
+        if sequences_key not in self.db:
+            self.db[sequences_key] = sequences.cpu()
+            self.db_counter[sequences_key] = 0
+        self.db_counter[sequences_key] += 1
+
+        self.queue.append((idx, type, batch_key,
+                             model_key, sequences_key, 
+                             distances.cpu()))
+    
+    def __iter__(self, shuffle=False, device=None):
+        iterable = self.queue
+
+        if shuffle:
+            iterable = random.sample(self.queue, len(self.queue))
+    
+        for idx, type, batch_key, model_key, sequences_key, distances in iterable:
+            device = device or torch.cuda.current_device()
+            batch = self.db[batch_key].type(torch.int32).to(device)
+            sequences = self.db[sequences_key].type(torch.int32).to(device)
+            distances = distances.to(device)
+            
+            model = self.db[model_key].to(device)
+            yield (idx, type, batch, model, sequences, distances)
+
 
 
 total_scoring_time = {
@@ -69,7 +148,18 @@ total_train_step_time = {
 }
 
 
-def aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device):
+train_score_network_time = {
+    'cuml': 0,
+    'tick': 0,
+}
+
+
+aggregation_step_time = {
+    'cuml': 0,
+    'tick': 0,
+}
+
+def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
         the perturbed model to compute the yo_i, the decoded output corresponding
         to the input x using the original model, and yp_i, the decoding output corresponding
@@ -78,64 +168,55 @@ def aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args
 
         It returns a set of tuples with each tuple of the form (x_i, y_i, yo_i, yp_i, \Delta).
     """
+    batch.squeeze_(0)
+    batch = batch.to(device)
+    assert batch.size(1) >= args.context_length + 1
 
-    print('=' * 150)
-    print('Data aggregation.\n')
+    inp, target = batch[:, :-1], batch[:, 1:]
+    max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
+    model = model.to(device)
+    model.eval()
+    _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
+        model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
+    )
 
-    buffer = []
+    # Get the current MLE gradients
+    model.train()
+    cur_model = deepcopy(model)
+    model_with_grad, _ = ggs_utils.mle_grad(
+        cur_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
+    )
 
-    for step, batch in enumerate(train_dataloader):
+    per_model = deepcopy(model)
 
-        if step > args.aggregation_size:
-            break
+    for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
 
-        batch = batch.squeeze(0)
-        batch = batch.to(device)
-        assert batch.size(1) >= args.context_length + 1
+        gradient = -param_with_grad.grad.data
 
-        inp, target = batch[:, :-1], batch[:, 1:]
-        max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
+        if args.noise_scale == 'uniform':
+            noise_ = args.ggs_noise * torch.randn_like(param.data) * (gradient.abs().sum() / gradient.numel())
+        else:
+            noise_ = args.ggs_noise * torch.randn_like(param.data)
 
-        model.eval()
-        _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
-            model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
-        )
+        if step % 2 == 0:
+            epsilon = noise_ + gradient
+        else:
+            epsilon = noise_
 
-        # Get the current MLE gradients
-        model.train()
-        cur_model = deepcopy(model)
-        model_with_grad, _ = ggs_utils.mle_grad(
-            cur_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
-        )
+        param.data = param.data + epsilon
 
-        per_model = deepcopy(model)
+    _, per_decodings, per_distances = ggs_utils.decode_and_distance(
+        per_model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
+    )
 
-        for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
-
-            gradient = -param_with_grad.grad.data
-
-            if args.noise_scale == 'uniform':
-                noise_ = args.noise * torch.randn_like(param.data) * (gradient.abs().sum() / gradient.numel())
-            else:
-                noise_ = args.noise * torch.randn_like(param.data)
-
-            if step % 2 == 0:
-                epsilon = noise_ + gradient
-            else:
-                epsilon = noise_
-
-            param.data = param.data + epsilon
-
-        _, per_decodings, per_distances = ggs_utils.decode_and_distance(
-            per_model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
-        )
-
-        buffer.append((batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model))
-
+    buffer.append(step, 'current', batch, model,
+                    cur_decodings, cur_distances)
+    buffer.append(step, 'pertubed', batch, per_model,
+                    per_decodings, per_distances)
     return buffer
 
 
-def train_scoring_network(buffers, model, phi_network, phi_optimizer, args):
+def train_score_network(buffers, model, phi_network, phi_optimizer, device, args):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
         mimic the original cost function (C) by minimizing the L2 loss.
         $C$ is defined as
@@ -148,49 +229,56 @@ def train_scoring_network(buffers, model, phi_network, phi_optimizer, args):
 
     print('=' * 150)
     print('Start training the score network.\n')
-
     train_loss = 0.
     num_docs = 0
+    phi_network.train()
 
-    for step, (batch, cur_decodings, per_decodings, cur_distances, per_distances, per_model) in enumerate(buffers):
+    for epoch in range(args.score_network_epochs):
+        train_score_network_start = timer()
+        for step, (idx, type, batch, model, sequences, distances) in enumerate(buffers):
+            
+            model.eval()
 
-        model.eval()
-        per_model.eval()
+            output = model(batch, output_hidden_states=True)
 
-        context_batch = utils.wrap_context_batch(batch, args)
-        context_batch = context_batch.to(batch.device)
+            emb = output.hidden_states[-1][:, -1, :]
 
-        cur_emb = model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
-        per_emb = per_model(context_batch, output_hidden_states=True).hidden_states[-1][:, -1, :].detach()
+            phi_optimizer.zero_grad()
 
-        phi_network.train()
-        phi_optimizer.zero_grad()
+            outputs = phi_network(emb)
 
-        outputs = phi_network(cur_emb - per_emb)
+            if distances.size(0) != outputs.size(0):
+                print(f"{idx} {type} {batch.size()} {sequences.size()} {distances.size()}")
+                continue
 
-        loss = F.mse_loss(
-            outputs,
-            (per_distances - cur_distances).view(-1, 1),
-            reduction='none'
-        )
-        loss = loss.sum()
+            loss = F.mse_loss(
+                outputs,
+                distances.view(-1, 1),
+            )
+            loss.backward()
+            phi_optimizer.step()
 
-        loss.backward()
-        phi_optimizer.step()
+            train_loss += loss.item()
+            num_docs += batch.size(0)
 
-        train_loss += loss.item()
-        num_docs += batch.size(0)
+            if step % 5 == 0 and step > 0:
+                cur_loss = train_loss / num_docs
+                print('Epoch: %d :: Step: %d, Loss: %.2f' % (epoch, step, cur_loss), end='\r')
+        train_score_network_end = timer()
+        train_score_network_time['cuml'] += train_score_network_end - train_score_network_start
+        train_score_network_time['tick'] += 1
+        print(f"Train score network epoch {epoch} done!" + 
+              f"Avg Epoch Time: {train_score_network_time['cuml']/train_score_network_time['tick']}")
+    print('Done training the score network.\n')
+    print('=' * 150)
 
-        if step % 5 == 0 and step > 0:
-            cur_loss = train_loss / num_docs
-            print('Step: %d, Loss: %.2f' % (step, cur_loss))
 
 
 def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args, prefix):
     decoded = defaultdict(list)
     bpes_curr, outputs, distance_curr = ggs_utils.decode_and_distance(
-            model, tokenizer, batch, score_model, max_length, device, args
-    )
+                                                     model, tokenizer, batch, score_model, 
+                                                    max_length, device, args, average_distance=True)
     for i, idxs in enumerate(bpes_curr):
         decoded[f'{prefix}_{i}'].append(tokenizer.decode(idxs))
     return distance_curr, bpes_curr, decoded
@@ -204,7 +292,12 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     decoded = defaultdict(list)
     model.eval()
     embed = model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
-    return embed, outputs, decoded
+    batched_distances = phi_network(embed).detach().cpu() 
+
+    # average across batch to compute c(\theta).
+    distances = batched_distances.mean(dim=0).item()
+
+    return distances, outputs, decoded
 
 
 def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, scoring_function=original_mgs_scoring_function):
@@ -258,9 +351,9 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
     # -- Decode with perturbed models and compute task metric
     distances = []
     for i, p_model in enumerate(perturbed_models):
-        distance, _, decoded_samples = scoring_function(
-            p_model, tokenizer, batch, score_model, max_length, device, args, prefix=f'preturb_{i}'
-        )
+
+        distance, _, decoded_samples  = scoring_function(p_model, tokenizer, batch, score_model, 
+                                                            max_length, device, args, prefix=f'preturb_{i}')
         distances.append(distance)
         decoded.update(decoded_samples)
     perturb_scoring_end = timer()
@@ -306,12 +399,32 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
     total_mgs_time['tick'] += 1
     return decoded
 
+def shall_aggregate_data(step, total_num_batches, args):
+    # For first 25% of batches, aggregate data every batch.
+    if step < total_num_batches//4: 
+        return True
+    
+    # For best 25% of the batches, aggregate data every alternate batch.
+    if step < total_num_batches//2 and step % 2 == 0:
+        return True
+    
+    # For last 50% of the batches, sample every fourth batch.
+    if step % 4 == 0:
+        return True
+    
+    return False
+    
 
 class MLP(nn.Module):
-    def __init__(self, input_size):
+    def __init__(self, input_size, hidden_size=1024):
         super(MLP, self).__init__()
 
-        self.fc = nn.Linear(input_size, 1)
+        self.fc = nn.Sequential(
+                        nn.Linear(input_size, hidden_size), 
+                        nn.ReLU(), 
+                        nn.Linear(hidden_size, hidden_size),
+                        nn.ReLU(),
+                        nn.Linear(hidden_size, 1))
 
     def forward(self, x):
         output = self.fc(x)
@@ -326,14 +439,22 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         sampler=train_sampler,
         batch_size=1
     )
+    
 
-    optimizer, scheduler = utils.get_optimizer(model, len(train_dataloader), args)
+    total_num_batches = len(train_dataloader)
+    optimizer, scheduler = utils.get_optimizer(model, total_num_batches, args)
 
     if args.efficient:
         config = GPT2Config()
         phi_network = MLP(input_size=config.hidden_size).to(device)
         phi_optimizer = optim.Adam(phi_network.parameters(), lr=0.001)
-        scoring_function = partial(dagger_mgs_scoring_function, phi_network=phi_network)
+
+        scoring_function = partial(dagger_mgs_scoring_function, phi_network)
+
+        buffer = RingBuffer(max_size=args.max_buffer_size, 
+                    persistence='shelve',
+                    persistent_file_path=os.path.join(args.save_base_dir,
+                                                "persistence_datastore"))
     else:
         scoring_function = original_mgs_scoring_function
         phi_network = None
@@ -343,20 +464,65 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     patience = args.patience
     stats_cache = defaultdict(list)
     average_times = {}
-
     score_model = deepcopy(model)
+
+    # Initialize buffer and pretrain score network.
+    if args.efficient:
+        print('=' * 150)
+
+        for step, batch in enumerate(train_dataloader):
+            if step > args.initial_train_data_size:
+                break
+            aggregate_step_start = timer()
+            buffer = aggregate_score_data(step,
+                                            batch, 
+                                            buffer,
+                                            model, 
+                                            score_model, 
+                                            tokenizer, 
+                                            args, 
+                                            device)
+            aggregate_step_end = timer()
+            aggregation_step_time['cuml'] += aggregate_step_end - aggregate_step_start
+            aggregation_step_time['tick'] += 1
+            print(f"Aggregated Batches:  {step}/{total_num_batches}." +
+                   f"Avg time: {aggregation_step_time['cuml']/aggregation_step_time['tick']}", 
+                  end='\r')
+
+
+        train_score_network(buffer, 
+                            model, 
+                            phi_network, 
+                            phi_optimizer, 
+                            device,
+                            args)
+
+
     for epoch_number in range(args.num_train_epochs):
         metrics = GuidedMetrics()
 
-        if args.efficient:
-            buffers = aggregate_scoring_data(train_dataloader, model, score_model, tokenizer, args, device)
-
-            print('=' * 150)
-            print('Start training the score network.\n')
-
-            train_scoring_network(buffers, model, phi_network, phi_optimizer, args)
-
         for step, batch in enumerate(train_dataloader):
+            if args.efficient:
+                if shall_aggregate_data(step, total_num_batches, args):
+                    buffer = aggregate_score_data(step,
+                                                    batch, 
+                                                    buffer,
+                                                    model, 
+                                                    score_model, 
+                                                    tokenizer, 
+                                                    args, 
+                                                    device)
+
+
+                if (step + 1) % args.retrain_score_network_every == 0:
+                    print('=' * 150)
+                    print('Start training the score network.\n')
+                    train_score_network(buffer, 
+                                        model, 
+                                        phi_network, 
+                                        phi_optimizer, 
+                                        device,
+                                        args)
 
             train_step_time_start = timer()
 
@@ -478,10 +644,19 @@ def add_args(parser):
     parser.add_argument(
         "--max-train-steps", type=int, default=-1
     )
+    parser.add_argument(
+        "--retrain-score-network-every", type=int, default=1000
+    )
+    parser.add_argument(
+        "--initial-train-data-size", type=int, default=1000
+    )
     parser.add_argument('--include-mle-gradient', action='store_true')
 
     parser.add_argument(
-        "--aggregation_size", type=int, default=100
+        "--max-buffer-size", type=int, default=3000,
+    )
+    parser.add_argument(
+        "--score-network-epochs", type=int, default=10,
     )
     parser.add_argument('--efficient', action='store_true')
     
