@@ -21,8 +21,12 @@ import shelve
 import hashlib
 import pickle
 
+
+def _hash(obj):
+    return hashlib.md5(str(obj).encode('utf-8')).hexdigest()
+
 class RingBuffer:
-    def __init__(self, max_size=1000, persistence='none', persistent_file_path=None):
+    def __init__(self, max_size=1000, persistence='none', persistent_file_path=None, shuffle=False, iter_device=None):
         self.max_size = max_size
         self.persistence = persistence
         self.queue = []
@@ -32,11 +36,16 @@ class RingBuffer:
         elif persistence == 'shelve':
             self.db = shelve.open(persistent_file_path)
         self.db_counter = {}
+
+        self.shuffle = shuffle
+        self.iter_device = None
+
     def __len__(self):
         return len(self.queue)
-
+    
     def append(self, idx, type, batch, model, 
                 sequences, distances):
+
         if len(self.queue) > self.max_size:
             (_, _, old_model_key, old_sequences_key, 
                 old_batch_key, old_distance_key) = self.queue.pop(0)
@@ -56,19 +65,19 @@ class RingBuffer:
                 del self.db_counter[old_sequences_key]
                 del self.db[old_sequences_key]
 
-        batch_key = f"batch_{batch.__hash__()}"
+        batch_key = f"batch_{_hash(batch)}"
         if batch_key not in self.db:
             self.db[batch_key] = batch.cpu()
             self.db_counter[batch_key] = 0
         self.db_counter[batch_key] += 1
 
-        model_key = f"model_{type}_{model.__hash__()}"
+        model_key = f"model_{type}_{_hash(model)}"
         if model_key not in self.db:
             self.db[model_key] = model.cpu()
             self.db_counter[model_key] = 0
         self.db_counter[model_key] += 1
 
-        sequences_key_suffix = str(sequences.__hash__())
+        sequences_key_suffix = _hash(sequences)
         sequences_key = f"sequence_{batch_key}_{model_key}_{sequences_key_suffix}"
         if sequences_key not in self.db:
             self.db[sequences_key] = sequences.cpu()
@@ -78,20 +87,23 @@ class RingBuffer:
         self.queue.append((idx, type, batch_key,
                              model_key, sequences_key, 
                              distances.cpu()))
-    
-    def __iter__(self, shuffle=False, device=None):
+
+    def __iter__(self):
         iterable = self.queue
 
-        if shuffle:
+        if self.shuffle:
             iterable = random.sample(self.queue, len(self.queue))
     
         for idx, type, batch_key, model_key, sequences_key, distances in iterable:
-            device = device or torch.cuda.current_device()
-            batch = self.db[batch_key].type(torch.int32).to(device)
-            sequences = self.db[sequences_key].type(torch.int32).to(device)
-            distances = distances.to(device)
+            device = self.iter_device or torch.cuda.current_device()
+            batch = self.db[batch_key].type(torch.int32) #.to(device)
+            sequences = self.db[sequences_key].type(torch.int32) # .to(device)
+            distances = distances #.to(device)
             
-            model = self.db[model_key].to(device)
+            model = self.db[model_key] #.to(device)
+
+            assert distances.size(0) == batch.size(0)
+
             yield (idx, type, batch, model, sequences, distances)
 
 
@@ -232,24 +244,26 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, device, args
     train_loss = 0.
     num_docs = 0
     phi_network.train()
-
+    phi_network = phi_network.to(device)
     for epoch in range(args.score_network_epochs):
         train_score_network_start = timer()
         for step, (idx, type, batch, model, sequences, distances) in enumerate(buffers):
             
+            model = model.to(device)
+            batch = batch.to(device)
+            distances = distances.to(device)
+
             model.eval()
 
             output = model(batch, output_hidden_states=True)
-
-            emb = output.hidden_states[-1][:, -1, :]
+            emb = output.hidden_states[-1][:, -1, :].detach()
 
             phi_optimizer.zero_grad()
 
             outputs = phi_network(emb)
 
-            if distances.size(0) != outputs.size(0):
-                print(f"{idx} {type} {batch.size()} {sequences.size()} {distances.size()}")
-                continue
+            assert distances.size(0) == outputs.size(0), \
+                f"{idx} {type} {batch.size()} {sequences.size()} {distances.size()}"
 
             loss = F.mse_loss(
                 outputs,
@@ -264,11 +278,14 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, device, args
             if step % 5 == 0 and step > 0:
                 cur_loss = train_loss / num_docs
                 print('Epoch: %d :: Step: %d, Loss: %.2f' % (epoch, step, cur_loss), end='\r')
+
         train_score_network_end = timer()
         train_score_network_time['cuml'] += train_score_network_end - train_score_network_start
         train_score_network_time['tick'] += 1
-        print(f"Train score network epoch {epoch} done!" + 
-              f"Avg Epoch Time: {train_score_network_time['cuml']/train_score_network_time['tick']}")
+        print()
+        print('Epoch: %d :: Loss: %.2f' % (epoch, cur_loss))
+        print(f"Train score network epoch {epoch} done!")
+        print(f"Avg Epoch Time: {train_score_network_time['cuml']/train_score_network_time['tick']}")
     print('Done training the score network.\n')
     print('=' * 150)
 
@@ -291,7 +308,10 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     outputs = torch.tensor([])
     decoded = defaultdict(list)
     model.eval()
-    embed = model(batch, output_hidden_states=True).hidden_states[-1][:, -1, :]
+    embed = model(batch, output_hidden_states=True)\
+                .hidden_states[-1][:, -1, :]\
+                .detach()
+
     batched_distances = phi_network(embed).detach().cpu() 
 
     # average across batch to compute c(\theta).
@@ -452,7 +472,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         scoring_function = partial(dagger_mgs_scoring_function, phi_network)
 
         buffer = RingBuffer(max_size=args.max_buffer_size, 
-                    persistence='shelve',
+                    persistence='none',
                     persistent_file_path=os.path.join(args.save_base_dir,
                                                 "persistence_datastore"))
     else:
@@ -474,14 +494,14 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
             if step > args.initial_train_data_size:
                 break
             aggregate_step_start = timer()
-            buffer = aggregate_score_data(step,
-                                            batch, 
-                                            buffer,
-                                            model, 
-                                            score_model, 
-                                            tokenizer, 
-                                            args, 
-                                            device)
+            aggregate_score_data(step,
+                                    batch, 
+                                    buffer,
+                                    model, 
+                                    score_model, 
+                                    tokenizer, 
+                                    args, 
+                                    device)
             aggregate_step_end = timer()
             aggregation_step_time['cuml'] += aggregate_step_end - aggregate_step_start
             aggregation_step_time['tick'] += 1
@@ -504,14 +524,14 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         for step, batch in enumerate(train_dataloader):
             if args.efficient:
                 if shall_aggregate_data(step, total_num_batches, args):
-                    buffer = aggregate_score_data(step,
-                                                    batch, 
-                                                    buffer,
-                                                    model, 
-                                                    score_model, 
-                                                    tokenizer, 
-                                                    args, 
-                                                    device)
+                    aggregate_score_data(step,
+                                            batch, 
+                                            buffer,
+                                            model, 
+                                            score_model, 
+                                            tokenizer, 
+                                            args, 
+                                            device)
 
 
                 if (step + 1) % args.retrain_score_network_every == 0:
