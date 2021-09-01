@@ -12,6 +12,7 @@ import seq_level.gpt2.train as train_utils
 import os
 from functools import partial
 from seq_level.gpt2.guided.metrics import GuidedMetrics
+from concurrent.futures import ThreadPoolExecutor
 
 from timeit import default_timer as timer
 import pandas as pd
@@ -20,13 +21,16 @@ import random
 import shelve
 import hashlib
 import pickle
+import logging
 
+def _hash_tensor(obj):
+    return hashlib.sha1(bytes(obj.cpu().numpy())).hexdigest()
 
-def _hash(obj):
-    return hashlib.md5(str(obj).encode('utf-8')).hexdigest()
+def _hash_model(model):
+    return hashlib.sha1(next(model.parameters()).detach().cpu().numpy()).hexdigest()
 
 class RingBuffer:
-    def __init__(self, max_size=1000, persistence='none', persistent_file_path=None, shuffle=False, iter_device=None):
+    def __init__(self, max_size=1000, persistence='none', persistent_file_path=None, shuffle=True, iter_device=None, on_device=True):
         self.max_size = max_size
         self.persistence = persistence
         self.queue = []
@@ -40,70 +44,88 @@ class RingBuffer:
         self.shuffle = shuffle
         self.iter_device = None
 
+        self.on_device = on_device
+        # self.executor = ThreadPoolExecutor(max_workers=6)
+
     def __len__(self):
         return len(self.queue)
     
     def append(self, idx, type, batch, model, 
                 sequences, distances):
 
-        if len(self.queue) > self.max_size:
-            (_, _, old_model_key, old_sequences_key, 
-                old_batch_key, old_distance_key) = self.queue.pop(0)
-            
+        print(f"Id: {idx}::" + 
+               f" Queue Size: {len(self.queue)}," + 
+               f" DB size: {len(self.db)}", end='\r')
+    
+        if len(self.queue) >= self.max_size:
+            (_, _, old_batch_key, old_model_key, 
+                old_sequences_key, old_distances) = self.queue.pop(0)
+            logging.debug("Removing item from Queue: " + 
+                           f"Batch: {old_batch_key} " + 
+                           f"Model: {old_model_key}.")
+
             self.db_counter[old_model_key] -= 1
             if self.db_counter[old_model_key] == 0:
                 del self.db_counter[old_model_key]
                 del self.db[old_model_key]
+                # self.executor.submit(self.db.pop, old_model_key)
 
             self.db_counter[old_batch_key] -= 1
             if self.db_counter[old_batch_key] == 0:
                 del self.db_counter[old_batch_key]
                 del self.db[old_batch_key]
+                # self.executor.submit(self.db.pop, old_batch_key)
 
-            self.db_counter[old_sequences_key] -= 1
-            if self.db_counter[old_sequences_key] == 0:
-                del self.db_counter[old_sequences_key]
-                del self.db[old_sequences_key]
+            # self.db_counter[old_sequences_key] -= 1
+            # if self.db_counter[old_sequences_key] == 0:
+            #     del self.db_counter[old_sequences_key]
+            #     del self.db[old_sequences_key]
 
-        batch_key = f"batch_{_hash(batch)}"
+        batch_key = f"batch_{_hash_tensor(batch)}"
         if batch_key not in self.db:
-            self.db[batch_key] = batch.cpu()
+            if not self.on_device:
+                batch = deepcopy(batch).cpu()
+            self.db[batch_key] = batch
             self.db_counter[batch_key] = 0
+            # self.executor.submit(self.db.setdefault, batch_key, batch)
         self.db_counter[batch_key] += 1
 
-        model_key = f"model_{type}_{_hash(model)}"
+        model_key = f"model_{type}_{_hash_model(model)}"
         if model_key not in self.db:
-            self.db[model_key] = model.cpu()
+            if not self.on_device:
+                model = deepcopy(model).cpu()
+            self.db[model_key] = model
             self.db_counter[model_key] = 0
+            # self.executor.submit(self.db.setdefault, model_key, model)
         self.db_counter[model_key] += 1
 
-        sequences_key_suffix = _hash(sequences)
-        sequences_key = f"sequence_{batch_key}_{model_key}_{sequences_key_suffix}"
-        if sequences_key not in self.db:
-            self.db[sequences_key] = sequences.cpu()
-            self.db_counter[sequences_key] = 0
-        self.db_counter[sequences_key] += 1
+        # sequences_key_suffix = _hash_tensor(sequences)
+        # sequences_key = f"sequence_{batch_key}_{model_key}_{sequences_key_suffix}"
+        # if sequences_key not in self.db:
+        #     self.db[sequences_key] = sequences.cpu()
+        #     self.db_counter[sequences_key] = 0
+        # self.db_counter[sequences_key] += 1
+        sequences_key = None
 
         self.queue.append((idx, type, batch_key,
-                             model_key, sequences_key, 
-                             distances.cpu()))
+                            model_key, sequences_key,
+                            distances.cpu()))
 
     def __iter__(self):
         iterable = self.queue
 
         if self.shuffle:
             iterable = random.sample(self.queue, len(self.queue))
-    
+
         for idx, type, batch_key, model_key, sequences_key, distances in iterable:
-            device = self.iter_device or torch.cuda.current_device()
-            batch = self.db[batch_key].type(torch.int32) #.to(device)
-            sequences = self.db[sequences_key].type(torch.int32) # .to(device)
-            distances = distances #.to(device)
-            
-            model = self.db[model_key] #.to(device)
+            batch = self.db[batch_key].type(torch.int32)
+            sequences = None
+            model = self.db[model_key]
 
-            assert distances.size(0) == batch.size(0)
-
+            if distances.size(0) != batch.size(0):
+                logging.error(f"Distance: {distances.size(0)}, Batch: ({batch.size()}), {batch_key} Sequence: {sequences_key}" + \
+                        f"Model: {model_key}.")
+                continue
             yield (idx, type, batch, model, sequences, distances)
 
 
@@ -182,7 +204,9 @@ def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, arg
     """
     batch.squeeze_(0)
     batch = batch.to(device)
-    assert batch.size(1) >= args.context_length + 1
+    if batch.size(1) < args.context_length + 1:
+        logging.error(f"Batch at step: {step} has sequences: {batch.size(1)} shorter than the context length: {args.context_length}")
+        return buffer
 
     inp, target = batch[:, :-1], batch[:, 1:]
     max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
@@ -228,7 +252,7 @@ def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, arg
     return buffer
 
 
-def train_score_network(buffers, model, phi_network, phi_optimizer, device, args):
+def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, device, args):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
         mimic the original cost function (C) by minimizing the L2 loss.
         $C$ is defined as
@@ -250,20 +274,29 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, device, args
         for step, (idx, type, batch, model, sequences, distances) in enumerate(buffers):
             
             model = model.to(device)
-            batch = batch.to(device)
+            batch_ = batch.clone().to(device)
             distances = distances.to(device)
 
             model.eval()
 
-            output = model(batch, output_hidden_states=True)
-            emb = output.hidden_states[-1][:, -1, :].detach()
+            pad = tokenizer.pad_token_id
+            batch_[batch == pad] = 0
+
+            mask = batch.ne(pad).float().to(device)
+
+            model_output = model(batch_, 
+                                 attention_mask=mask,
+                                 output_hidden_states=True)
+
+            emb = model_output.hidden_states[-1][:, -1, :].detach()
 
             phi_optimizer.zero_grad()
 
             outputs = phi_network(emb)
 
-            assert distances.size(0) == outputs.size(0), \
-                f"{idx} {type} {batch.size()} {sequences.size()} {distances.size()}"
+            if distances.size(0) != outputs.size(0):
+                logging.error(f"Batch: ({idx} {type} {batch.size()}) != Distance {distances.size()}")
+                continue
 
             loss = F.mse_loss(
                 outputs,
@@ -283,22 +316,24 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, device, args
         train_score_network_time['cuml'] += train_score_network_end - train_score_network_start
         train_score_network_time['tick'] += 1
         print()
-        print('Epoch: %d :: Loss: %.2f' % (epoch, cur_loss))
-        print(f"Train score network epoch {epoch} done!")
-        print(f"Avg Epoch Time: {train_score_network_time['cuml']/train_score_network_time['tick']}")
+        logging.info('Epoch: %d :: Loss: %.2f' % (epoch, cur_loss))
+        logging.info(f"Train score network epoch {epoch} done!")
+        logging.info(f"Avg Epoch Time: {train_score_network_time['cuml']/train_score_network_time['tick']}")
     print('Done training the score network.\n')
     print('=' * 150)
 
-
-
-def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args, prefix):
+def original_mgs_scoring_function(buffer, model, tokenizer, batch, score_model, max_length, device, args, prefix):
     decoded = defaultdict(list)
     bpes_curr, outputs, distance_curr = ggs_utils.decode_and_distance(
                                                      model, tokenizer, batch, score_model, 
-                                                    max_length, device, args, average_distance=True)
+                                                     max_length, device, args, average_distance=False)
+
+    buffer.append(args.log_step, prefix, batch, model,
+                        outputs, distance_curr)
+
     for i, idxs in enumerate(bpes_curr):
         decoded[f'{prefix}_{i}'].append(tokenizer.decode(idxs))
-    return distance_curr, bpes_curr, decoded
+    return distance_curr.mean().item(), bpes_curr, decoded
 
 
 def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_model, max_length, device, args, prefix):
@@ -307,10 +342,21 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     """
     outputs = torch.tensor([])
     decoded = defaultdict(list)
-    model.eval()
-    embed = model(batch, output_hidden_states=True)\
-                .hidden_states[-1][:, -1, :]\
-                .detach()
+    model.eval() 
+
+    pad = tokenizer.pad_token_id
+    mask = batch.ne(pad).float().to(model.device)
+
+    batch_ = batch.clone().to(model.device)
+    batch_[batch == pad] = 0
+    output = model(batch_,
+                  attention_mask=mask,
+                  output_hidden_states=True)
+    phi_network = phi_network.to(model.device)
+
+    embed = output \
+              .hidden_states[-1][:, -1, :] \
+              .detach()
 
     batched_distances = phi_network(embed).detach().cpu() 
 
@@ -320,9 +366,12 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     return distances, outputs, decoded
 
 
-def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, scoring_function=original_mgs_scoring_function):
+def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
+        scoring_function, 
+        phi_scoring_function=None):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
     """
+    distance_comp = []
     mgs_time_start = timer()
 
     inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
@@ -336,6 +385,13 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
     distance_curr, bpes_curr, decoded_samples = scoring_function(
         model, tokenizer, batch, score_model, max_length, device, args, prefix='original'
     )
+
+    if args.efficient and args.log_scoring_function and \
+       args.log_step % args.print_every == 1:
+        distance_score, _, _ = phi_scoring_function(model, tokenizer, batch, 
+                                score_model, max_length, device, args, prefix='original')
+        distance_comp.append(('original', distance_curr, distance_score))
+        logging.info(f"Distances: original: C => {distance_curr} C_\phi => {distance_score}")
     decoded.update(decoded_samples)
     curr_scoring_end = timer()
     curr_scoring_time['cuml'] += curr_scoring_end - curr_scoring_start
@@ -374,6 +430,14 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
 
         distance, _, decoded_samples  = scoring_function(p_model, tokenizer, batch, score_model, 
                                                             max_length, device, args, prefix=f'preturb_{i}')
+        if args.efficient and args.log_scoring_function and \
+            args.log_step % args.print_every == 1:
+            distance_score, _, _ = phi_scoring_function(p_model, tokenizer, batch, 
+                                score_model, max_length, device, args, prefix='preturb_{i}')
+            distance_comp.append(('preturb_{i}', distance, distance_score))
+            logging.info(f"Distances: preturb_{i}: C => {distance} C_\phi => {distance_score}")
+
+
         distances.append(distance)
         decoded.update(decoded_samples)
     perturb_scoring_end = timer()
@@ -421,6 +485,7 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
 
 def shall_aggregate_data(step, total_num_batches, args):
     # For first 25% of batches, aggregate data every batch.
+    return False
     if step < total_num_batches//4: 
         return True
     
@@ -467,18 +532,20 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     if args.efficient:
         config = GPT2Config()
         phi_network = MLP(input_size=config.hidden_size).to(device)
-        phi_optimizer = optim.Adam(phi_network.parameters(), lr=0.001)
-
-        scoring_function = partial(dagger_mgs_scoring_function, phi_network)
+        phi_optimizer = optim.Adam(phi_network.parameters())
 
         buffer = RingBuffer(max_size=args.max_buffer_size, 
                     persistence='none',
                     persistent_file_path=os.path.join(args.save_base_dir,
                                                 "persistence_datastore"))
+
+        # scoring_function = partial(dagger_mgs_scoring_function, phi_network, buffer)
+
     else:
-        scoring_function = original_mgs_scoring_function
         phi_network = None
         phi_optimizer = None
+
+    scoring_function = partial(original_mgs_scoring_function, buffer)
 
     best_val_loss = 10000
     patience = args.patience
@@ -489,10 +556,11 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     # Initialize buffer and pretrain score network.
     if args.efficient:
         print('=' * 150)
-
+        print("Started Initial Data Aggregation.")
         for step, batch in enumerate(train_dataloader):
-            if step > args.initial_train_data_size:
+            if step >= args.initial_train_data_size:
                 break
+
             aggregate_step_start = timer()
             aggregate_score_data(step,
                                     batch, 
@@ -502,18 +570,23 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                                     tokenizer, 
                                     args, 
                                     device)
+
             aggregate_step_end = timer()
             aggregation_step_time['cuml'] += aggregate_step_end - aggregate_step_start
             aggregation_step_time['tick'] += 1
-            print(f"Aggregated Batches:  {step}/{total_num_batches}." +
-                   f"Avg time: {aggregation_step_time['cuml']/aggregation_step_time['tick']}", 
-                  end='\r')
+            if step % args.print_every == 0:
+                logging.info(f"Aggregated Batches:  {step}/{total_num_batches}." +
+                   f"Avg time: {aggregation_step_time['cuml']/aggregation_step_time['tick']}")
+        print()
 
+        logging.info(f"Aggregated: {step * 2} items in {aggregation_step_time['cuml']} seconds.")
+        print('=' * 150)
 
         train_score_network(buffer, 
                             model, 
                             phi_network, 
-                            phi_optimizer, 
+                            phi_optimizer,
+                            tokenizer, 
                             device,
                             args)
 
@@ -531,24 +604,34 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                                             score_model, 
                                             tokenizer, 
                                             args, 
-                                            device)
+                                            device,
+                                            metrics)
 
 
                 if (step + 1) % args.retrain_score_network_every == 0:
-                    print('=' * 150)
-                    print('Start training the score network.\n')
                     train_score_network(buffer, 
                                         model, 
                                         phi_network, 
                                         phi_optimizer, 
+                                        tokenizer,
                                         device,
                                         args)
 
             train_step_time_start = timer()
 
-            batch = batch.squeeze(0)
+
+            if len(batch.shape) < 2:
+                    logging.error(f"Batch has a single item and is of shape: {batch.shape}")
+                    continue
+
+            if len(batch.shape) > 2:
+                batch = batch.squeeze(0)
+
+            if batch.size(-1) < args.context_length + 1:
+                logging.error(f"Batch at step: {step} has sequences: {batch.size(1)} shorter than the context length: {args.context_length}")
+                continue
+
             batch = batch.to(device)
-            assert batch.size(1) >= args.context_length + 1
 
             decoded = MGS(batch=batch,
                           model=model,
@@ -559,6 +642,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                           metrics=metrics,
                           optimizer=optimizer,
                           scoring_function=scoring_function,
+                          phi_scoring_function=partial(dagger_mgs_scoring_function, phi_network)
                          )
             train_step_time_end = timer()
 
@@ -568,7 +652,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
             if step % args.print_every == 0:
                 metrics_ = metrics.normalize('train')
                 metrics.reset()
-                print("Epoch %d   \t Step %d   \tmle: %.3f\tdist: %.3f\tnon_term: %.3E\tmle_weight: %.3E" % (
+                logging.info("Epoch %d   \t Step %d   \tmle: %.3f\tdist: %.3f\tnon_term: %.3E\tmle_weight: %.3E" % (
                     epoch_number,
                     step,
                     metrics_['train/mle_loss'],
@@ -598,7 +682,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                                                 columns=['avg. time'])
                     print(df)
 
-            if args.log_step % args.valid_every == 0 or step == 0:
+            if args.log_step % args.valid_every == 0:
                 val_loss, val_metrics, decodings = train_utils.valid_iteration(
                     dataset_tensor_dict['valid'], model, score_model, train_utils.get_mle_loss, tokenizer, device,
                     context_length=args.eval_context_length,
@@ -610,7 +694,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                     os.makedirs(save_dir)
                     utils.save(model, save_dir)
                 if val_metrics['valid/distance-%s' % args.ggs_metric] < best_val_loss:
-                    print('Best distance achieved (%.5f)' % val_metrics['valid/distance-%s' % args.ggs_metric])
+                    logging.info('Best distance achieved (%.5f)' % val_metrics['valid/distance-%s' % args.ggs_metric])
                     if not args.no_checkpoint:
                         utils.save(model, args.save_base_dir)
                     utils.save_metrics(val_metrics, args)
@@ -665,15 +749,15 @@ def add_args(parser):
         "--max-train-steps", type=int, default=-1
     )
     parser.add_argument(
-        "--retrain-score-network-every", type=int, default=1000
+        "--retrain-score-network-every", type=int, default=300
     )
     parser.add_argument(
-        "--initial-train-data-size", type=int, default=1000
+        "--initial-train-data-size", type=int, default=2000,
     )
     parser.add_argument('--include-mle-gradient', action='store_true')
 
     parser.add_argument(
-        "--max-buffer-size", type=int, default=3000,
+        "--max-buffer-size", type=int, default=4000,
     )
     parser.add_argument(
         "--score-network-epochs", type=int, default=10,
@@ -681,5 +765,7 @@ def add_args(parser):
     parser.add_argument('--efficient', action='store_true')
     
     parser.add_argument('--plot-times', action='store_true')
+
+    parser.add_argument('--log-scoring-function', action='store_true')
 
     return parser
