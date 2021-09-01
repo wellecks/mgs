@@ -28,7 +28,7 @@ MODEL_NAME=${model_name:="gpt2"}
 LOSS=${loss:="mle"}
 TPORT=${port:=8001}
 EXP_NAME=${exp_name:="wikipedia103/"}"_${MODEL_NAME}_${LOSS}"
-OUTPUT_DIR_SUFFIX="${MODEL_NAME}_${LOSS}"
+OUTPUT_DIR_SUFFIX="${MODEL_NAME}_${LOSS}_${SLURM_JOB_ID}"
 SAVE_BASE_DIR=${save_dir:-"./wikipedia103"}
 
 if [ -d ${SAVE_BASE_DIR} ]; then
@@ -74,8 +74,8 @@ else
             cmd+=" --efficient  --log-scoring-function "
 						if [ -n "${debug}" ];
 						then
-							cmd+=' --plot-times --log-scoring-function --plot-times --score-network-epochs 1000 --initial-train-data-size 30 --retrain-score-network-every 100 --max-buffer-size 80'
-							# cmd+=' --plot-times --score-network-epochs 10 --initial-train-data-size 200 --retrain-score-network-every 100 --max-buffer-size 400'
+							# cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 10 --retrain-score-network-every 100 --max-buffer-size 80 --on-device'
+							cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 300 --retrain-score-network-every 100 --max-buffer-size 600'
 						fi
         fi
 	else
