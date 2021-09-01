@@ -36,7 +36,7 @@ if [ -d ${SAVE_BASE_DIR} ]; then
 fi 
 
 
-cmd="python seq_level/gpt2/train.py --dataset-path=$SLURM_TMPDIR/wikitext103_raw_gpt2bpe.pkl"
+cmd="python -u seq_level/gpt2/train.py --dataset-path=$SLURM_TMPDIR/wikitext103_raw_gpt2bpe.pkl"
 
 if [ ${LOSS} = mle ];
 then
@@ -71,10 +71,11 @@ else
 
         if [ -n "${efficient}" ]; 
         then
-            cmd+=" --efficient "
+            cmd+=" --efficient  --log-scoring-function "
 						if [ -n "${debug}" ];
 						then
-							cmd+='--score-network-epochs 1 --initial-train-data-size 5'
+							cmd+=' --plot-times --log-scoring-function --plot-times --score-network-epochs 1000 --initial-train-data-size 30 --retrain-score-network-every 100 --max-buffer-size 80'
+							# cmd+=' --plot-times --score-network-epochs 10 --initial-train-data-size 200 --retrain-score-network-every 100 --max-buffer-size 400'
 						fi
         fi
 	else
