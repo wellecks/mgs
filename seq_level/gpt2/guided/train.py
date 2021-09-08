@@ -85,7 +85,7 @@ class RingBuffer:
         batch_key = f"batch_{_hash_tensor(batch)}"
         if batch_key not in self.db:
             if not self.on_device:
-                batch = deepcopy(batch).to("cpu", non_blocking=True)
+                batch = deepcopy(batch).to(device=torch.device("cpu"))
             self.db[batch_key] = batch
             self.db_counter[batch_key] = 0
             # self.executor.submit(self.db.setdefault, batch_key, batch)
@@ -94,7 +94,7 @@ class RingBuffer:
         model_key = f"model_{type}_{_hash_model(model)}"
         if model_key not in self.db:
             if not self.on_device:
-                model = deepcopy(model).to("cpu", non_blocking=True)
+                model = deepcopy(model).to(device=torch.device("cpu"))
             self.db[model_key] = model
             self.db_counter[model_key] = 0
             # self.executor.submit(self.db.setdefault, model_key, model)
@@ -204,14 +204,14 @@ def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, arg
         It returns a set of tuples with each tuple of the form (x_i, y_i, yo_i, yp_i, \Delta).
     """
     batch.squeeze_(0)
-    batch = batch.to(device)
+    batch = batch.to(device=device)
     if batch.size(1) < args.context_length + 1:
         logging.error(f"Batch at step: {step} has sequences: {batch.size(1)} shorter than the context length: {args.context_length}")
         return buffer
 
     inp, target = batch[:, :-1], batch[:, 1:]
     max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
-    model = model.to(device)
+    model = model.to(device=device)
     model.eval()
     _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
         model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
@@ -269,23 +269,23 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, d
     print('=' * 150)
     print('Start training the score network.\n')
     phi_network.train()
-    phi_network = phi_network.to(device)
+    phi_network = phi_network.to(device=device)
     for epoch in range(args.score_network_epochs):
         train_loss = 0.
         num_docs = 0
         train_score_network_start = timer()
         for step, (idx, type, batch, model, sequences, distances) in enumerate(buffers):
             
-            model = deepcopy(model).to(device)
-            batch_ = deepcopy(batch).to(device)
-            distances = deepcopy(distances).to(device)
+            model = model.to(device=device)
+            batch_ = deepcopy(batch).to(device=device)
+            distances = distances.to(device=device)
 
             model.eval()
 
             pad = tokenizer.pad_token_id
             batch_[batch == pad] = 0
 
-            mask = batch.ne(pad).float().to(device)
+            mask = batch.ne(pad).float().to(device=device)
 
             model_output = model(batch_, 
                                  attention_mask=mask,
@@ -314,6 +314,11 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, d
             cur_loss = train_loss / num_docs
             if step % 5 == 0 and step > 0:
                 print('Epoch: %d :: Step: %d, Loss: %.2f' % (epoch, step, cur_loss), end='\r')
+
+            # Move model back to CPU so that it doesn't hog GPU
+            # memory as it will not be removed from the context.
+            model.to(device=torch.device("cpu"))
+            distances.to(device=torch.device("cpu"))
 
         if min_train_loss < cur_loss:
             patience_counter += 1
@@ -359,14 +364,14 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     model.eval() 
 
     pad = tokenizer.pad_token_id
-    mask = batch.ne(pad).float().to(model.device)
+    mask = batch.ne(pad).float().to(device=model.device)
 
-    batch_ = batch.clone().to(model.device)
+    batch_ = batch.clone().to(device=model.device)
     batch_[batch == pad] = 0
     output = model(batch_,
                   attention_mask=mask,
                   output_hidden_states=True)
-    phi_network = phi_network.to(model.device)
+    phi_network = phi_network.to(device=model.device)
 
     embed = output \
               .hidden_states[-1][:, -1, :] \
@@ -388,7 +393,7 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer,
     distance_comp = []
     mgs_time_start = timer()
 
-    inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)
+    inp, target = batch[:, :-1].to(device=device), batch[:, 1:].to(device=device)
 
     # -- Decode with current model (required for computing the 'weights' later).
     max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
@@ -544,7 +549,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
     if args.efficient:
         config = GPT2Config()
-        phi_network = MLP(input_size=config.hidden_size).to(device)
+        phi_network = MLP(input_size=config.hidden_size).to(device=device)
         phi_optimizer = optim.Adam(phi_network.parameters())
 
         buffer = RingBuffer(max_size=args.max_buffer_size, 
@@ -644,7 +649,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                 logging.error(f"Batch at step: {step} has sequences: {batch.size(1)} shorter than the context length: {args.context_length}")
                 continue
 
-            batch = batch.to(device)
+            batch = batch.to(device=device)
 
             decoded = MGS(batch=batch,
                           model=model,

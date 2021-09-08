@@ -74,8 +74,8 @@ else
             cmd+=" --efficient  --log-scoring-function "
 						if [ -n "${debug}" ];
 						then
-							# cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 10 --retrain-score-network-every 100 --max-buffer-size 80 --on-device'
-							cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 300 --retrain-score-network-every 100 --max-buffer-size 600'
+							cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 10 --retrain-score-network-every 100 --max-buffer-size 80'
+							# cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 300 --retrain-score-network-every 100 --max-buffer-size 600'
 						fi
         fi
 	else
