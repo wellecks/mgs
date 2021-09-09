@@ -52,7 +52,7 @@ class RingBuffer:
         return len(self.queue)
     
     def append(self, idx, type, batch, model, 
-                sequences, distances):
+                sequences, distances, rng_state=None):
 
         print(f"Id: {idx}::" + 
                f" Queue Size: {len(self.queue)}," + 
@@ -60,7 +60,7 @@ class RingBuffer:
     
         if len(self.queue) >= self.max_size:
             (_, _, old_batch_key, old_model_key, 
-                old_sequences_key, old_distances) = self.queue.pop(0)
+                old_sequences_key, old_distances, _) = self.queue.pop(0)
             logging.debug("Removing item from Queue: " + 
                            f"Batch: {old_batch_key} " + 
                            f"Model: {old_model_key}.")
@@ -69,13 +69,11 @@ class RingBuffer:
             if self.db_counter[old_model_key] == 0:
                 del self.db_counter[old_model_key]
                 del self.db[old_model_key]
-                # self.executor.submit(self.db.pop, old_model_key)
 
             self.db_counter[old_batch_key] -= 1
             if self.db_counter[old_batch_key] == 0:
                 del self.db_counter[old_batch_key]
                 del self.db[old_batch_key]
-                # self.executor.submit(self.db.pop, old_batch_key)
 
             # self.db_counter[old_sequences_key] -= 1
             # if self.db_counter[old_sequences_key] == 0:
@@ -88,16 +86,14 @@ class RingBuffer:
                 batch = deepcopy(batch).to(device=torch.device("cpu"))
             self.db[batch_key] = batch
             self.db_counter[batch_key] = 0
-            # self.executor.submit(self.db.setdefault, batch_key, batch)
         self.db_counter[batch_key] += 1
 
-        model_key = f"model_{type}_{_hash_model(model)}"
+        model_key = f"model_{_hash_model(model)}"
         if model_key not in self.db:
             if not self.on_device:
                 model = deepcopy(model).to(device=torch.device("cpu"))
             self.db[model_key] = model
             self.db_counter[model_key] = 0
-            # self.executor.submit(self.db.setdefault, model_key, model)
         self.db_counter[model_key] += 1
 
         # sequences_key_suffix = _hash_tensor(sequences)
@@ -110,7 +106,7 @@ class RingBuffer:
 
         self.queue.append((idx, type, batch_key,
                             model_key, sequences_key,
-                            distances.cpu()))
+                            distances.cpu(), rng_state))
 
     def __iter__(self):
         iterable = self.queue
@@ -118,8 +114,8 @@ class RingBuffer:
         if self.shuffle:
             iterable = random.sample(self.queue, len(self.queue))
 
-        for idx, type, batch_key, model_key, sequences_key, distances in iterable:
-            batch = self.db[batch_key].type(torch.int32)
+        for idx, type, batch_key, model_key, sequences_key, distances, rng_state in iterable:
+            batch = self.db[batch_key].type(torch.long)
             sequences = None
             model = self.db[model_key]
 
@@ -127,7 +123,7 @@ class RingBuffer:
                 logging.error(f"Distance: {distances.size(0)}, Batch: ({batch.size()}), {batch_key} Sequence: {sequences_key}" + \
                         f"Model: {model_key}.")
                 continue
-            yield (idx, type, batch, model, sequences, distances)
+            yield (idx, type, batch, model, sequences, distances, rng_state)
 
 
 
@@ -216,41 +212,49 @@ def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, arg
     _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
         model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
     )
+    buffer.append(step, 'current', batch, model, cur_decodings, cur_distances)
 
     # Get the current MLE gradients
     model.train()
-    cur_model = deepcopy(model)
-    model_with_grad, _ = ggs_utils.mle_grad(
-        cur_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
-    )
-
-    per_model = deepcopy(model)
-
-    for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
-
-        gradient = -param_with_grad.grad.data
-
-        if args.noise_scale == 'uniform':
-            noise_ = args.ggs_noise * torch.randn_like(param.data) * (gradient.abs().sum() / gradient.numel())
-        else:
-            noise_ = args.ggs_noise * torch.randn_like(param.data)
-
-        if step % 2 == 0:
-            epsilon = noise_ + gradient
-        else:
-            epsilon = noise_
-
-        param.data = param.data + epsilon
+    per_model, rng_state = perturb(model, batch, step, tokenizer, args, device=device)
 
     _, per_decodings, per_distances = ggs_utils.decode_and_distance(
         per_model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
     )
-
-    buffer.append(step, 'current', batch, model,
-                    cur_decodings, cur_distances)
-    buffer.append(step, 'pertubed', batch, per_model,
-                    per_decodings, per_distances)
+    buffer.append(step, 'pertubed', batch, model, per_decodings, per_distances, rng_state=rng_state)
     return buffer
+
+
+def perturb(model, batch, step,  tokenizer, args,rng_state=None, device=None):
+    per_model = deepcopy(model)
+    inp, target = batch[:, :-1], batch[:, 1:]
+
+    model_with_grad, _ = ggs_utils.mle_grad(
+        per_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
+    )
+    
+    per_model.zero_grad()
+    with ggs_utils.RNG(rng_state, device) as (rng, rng_state):
+
+        for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
+            gradient = -param_with_grad.grad.data
+
+            perturbation = torch.randn(param.size(), generator=rng, device=param.device)
+
+            if args.noise_scale == 'uniform':
+                noise_ = args.ggs_noise * perturbation * (gradient.abs().sum() / gradient.numel())
+            else:
+                noise_ = args.ggs_noise * perturbation
+
+            # TODO: Should we consider random noise addition for data aggregation and
+            # score training. 
+            if step % 2 == 0:
+                epsilon = noise_ + gradient
+            else:
+                epsilon = noise_
+
+            param.data = param.data + epsilon
+    return per_model, rng_state
 
 
 def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, device, args):
@@ -274,16 +278,20 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, d
         train_loss = 0.
         num_docs = 0
         train_score_network_start = timer()
-        for step, (idx, type, batch, model, sequences, distances) in enumerate(buffers):
+        for step, (idx, type, batch, model, sequences, distances, rng_state) in enumerate(buffers):
             
             model = model.to(device=device)
+
             batch_ = deepcopy(batch).to(device=device)
+            pad = tokenizer.pad_token_id
+            batch_[batch == pad] = 0
+
+            if type == "pertubed":
+                model, _ = perturb(model, batch, idx, tokenizer, args, rng_state=rng_state, device=device)
+            
             distances = distances.to(device=device)
 
             model.eval()
-
-            pad = tokenizer.pad_token_id
-            batch_[batch == pad] = 0
 
             mask = batch.ne(pad).float().to(device=device)
 
@@ -770,12 +778,12 @@ def add_args(parser):
         "--retrain-score-network-every", type=int, default=300
     )
     parser.add_argument(
-        "--initial-train-data-size", type=int, default=400,
+        "--initial-train-data-size", type=int, default=1000,
     )
     parser.add_argument('--include-mle-gradient', action='store_true')
 
     parser.add_argument(
-        "--max-buffer-size", type=int, default=800,
+        "--max-buffer-size", type=int, default=2000,
     )
     parser.add_argument(
         "--score-network-epochs", type=int, default=100,

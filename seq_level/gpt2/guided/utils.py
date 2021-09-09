@@ -264,3 +264,20 @@ def load_model(args, device):
 
 class GPT2Wrapper(GPT2LMHeadModel):
     pass
+
+class RNG(object):
+    def __init__(self, rng_state=None, device=None):
+        self.rng = torch.Generator(device=device)
+        self.rng_state = rng_state
+        self.current_rng_state = self.rng.seed()
+
+    def __enter__(self):
+        if self.rng_state is not None:
+            self.rng.manual_seed(self.rng_state)
+        else:
+            self.rng.manual_seed(self.current_rng_state)
+        return self.rng, self.rng.initial_seed()
+
+    def __exit__(self, type, value, traceback):
+        self.rng.manual_seed(self.current_rng_state)
+        return True
