@@ -3,6 +3,7 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer
 import editdistance
 import torch
 import numpy as np
+import hashlib
 from copy import deepcopy
 
 from nltk import ngrams
@@ -240,6 +241,9 @@ def compute_weight(distance, perturbed_distances, log_rhos, beta):
     log_ws = torch.log_softmax(ws, 0)
     return log_ws
 
+def get_model_id(model):
+    return hashlib.sha1(next(model.parameters()).detach().cpu().numpy()).hexdigest()
+
 
 def update(model, update_directions, optimizer, clip_grad_norm=1.0):
     optimizer.zero_grad()
@@ -249,6 +253,8 @@ def update(model, update_directions, optimizer, clip_grad_norm=1.0):
     if clip_grad_norm > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
     optimizer.step()
+    return get_model_id(model)
+
 
 
 def load_model(args, device):

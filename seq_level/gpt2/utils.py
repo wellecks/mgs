@@ -62,7 +62,7 @@ class LineDataset(Dataset):
             batch = sorted_data[i:i+batch_size]
             batch = self._pad_batch(batch, element_size)
 
-            batches.append(batch)
+            batches.append((f"{self.split_name}_{i}", batch))
             i = i + batch_size
 
         return batches
@@ -79,7 +79,8 @@ class LineDataset(Dataset):
         return len(self.batches)
 
     def __getitem__(self, index):
-        return torch.tensor(self.batches[index], dtype=torch.long)
+        batch_idx, batch = self.batches[index]
+        return (batch_idx, torch.tensor(batch, dtype=torch.long))
 
 
 def generate_batch(model, tokenizer, batch, context_length, device, max_length, decoder, fixed_length):

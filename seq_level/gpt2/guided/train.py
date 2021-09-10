@@ -30,6 +30,8 @@ def _hash_tensor(obj):
 def _hash_model(model):
     return hashlib.sha1(next(model.parameters()).detach().cpu().numpy()).hexdigest()
 
+MODEL_ID = None
+
 class RingBuffer:
     def __init__(self, max_size=1000, persistence='none', persistent_file_path=None, shuffle=True, iter_device=None, on_device=False):
         self.max_size = max_size
@@ -51,7 +53,7 @@ class RingBuffer:
     def __len__(self):
         return len(self.queue)
     
-    def append(self, idx, type, batch, model, 
+    def append(self, idx, type, batch_id, batch, model, 
                 sequences, distances, rng_state=None):
 
         print(f"Id: {idx}::" + 
@@ -80,7 +82,8 @@ class RingBuffer:
             #     del self.db_counter[old_sequences_key]
             #     del self.db[old_sequences_key]
 
-        batch_key = f"batch_{_hash_tensor(batch)}"
+        # batch_key = f"batch_{_hash_tensor(batch)}"
+        batch_key = f"batch_{batch_id}"
         if batch_key not in self.db:
             if not self.on_device:
                 batch = deepcopy(batch).to(device=torch.device("cpu"))
@@ -88,7 +91,7 @@ class RingBuffer:
             self.db_counter[batch_key] = 0
         self.db_counter[batch_key] += 1
 
-        model_key = f"model_{_hash_model(model)}"
+        model_key = f"model_{MODEL_ID}"
         if model_key not in self.db:
             if not self.on_device:
                 model = deepcopy(model).to(device=torch.device("cpu"))
@@ -190,7 +193,7 @@ aggregation_step_time = {
     'tick': 0,
 }
 
-def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, args, device):
+def aggregate_score_data(step, batch_id, batch, buffer, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
         the perturbed model to compute the yo_i, the decoded output corresponding
         to the input x using the original model, and yp_i, the decoding output corresponding
@@ -212,7 +215,7 @@ def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, arg
     _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
         model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
     )
-    buffer.append(step, 'current', batch, model, cur_decodings, cur_distances)
+    buffer.append(step, 'current', batch_id, batch, model, cur_decodings, cur_distances)
 
     # Get the current MLE gradients
     model.train()
@@ -221,7 +224,7 @@ def aggregate_score_data(step, batch, buffer, model, score_model, tokenizer, arg
     _, per_decodings, per_distances = ggs_utils.decode_and_distance(
         per_model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
     )
-    buffer.append(step, 'pertubed', batch, model, per_decodings, per_distances, rng_state=rng_state)
+    buffer.append(step, 'pertubed', batch_id, batch, model, per_decodings, per_distances, rng_state=rng_state)
     return buffer
 
 
@@ -229,26 +232,27 @@ def perturb(model, batch, step,  tokenizer, args,rng_state=None, device=None):
     per_model = deepcopy(model)
     inp, target = batch[:, :-1], batch[:, 1:]
 
-    model_with_grad, _ = ggs_utils.mle_grad(
-        per_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
-    )
+    if step % 2 == 0:
+        model_with_grad, _ = ggs_utils.mle_grad(
+            per_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
+        )
+        model_with_grad_param_dict = dict(model_with_grad.named_parameters())
     
-    per_model.zero_grad()
     with ggs_utils.RNG(rng_state, device) as (rng, rng_state):
-
-        for param, (name, param_with_grad) in zip(per_model.parameters(), model_with_grad.named_parameters()):
-            gradient = -param_with_grad.grad.data
-
+        for name, param in per_model.named_parameters():
             perturbation = torch.randn(param.size(), generator=rng, device=param.device)
 
             if args.noise_scale == 'uniform':
-                noise_ = args.ggs_noise * perturbation * (gradient.abs().sum() / gradient.numel())
+                noise_ = args.ggs_noise * perturbation *  args.learning_rate * (param.data.abs().sum() / param.data.numel())
             else:
                 noise_ = args.ggs_noise * perturbation
 
             # TODO: Should we consider random noise addition for data aggregation and
             # score training. 
             if step % 2 == 0:
+                param_with_grad = model_with_grad_param_dict[name]
+                gradient = -param_with_grad.grad.data
+
                 epsilon = noise_ + gradient
             else:
                 epsilon = noise_
@@ -257,7 +261,7 @@ def perturb(model, batch, step,  tokenizer, args,rng_state=None, device=None):
     return per_model, rng_state
 
 
-def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, device, args):
+def train_score_network(buffers, model, phi_network, tokenizer, device, args):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
         mimic the original cost function (C) by minimizing the L2 loss.
         $C$ is defined as
@@ -274,6 +278,10 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, d
     print('Start training the score network.\n')
     phi_network.train()
     phi_network = phi_network.to(device=device)
+
+    phi_optimizer = optim.Adam(phi_network.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.StepLR(phi_optimizer, step_size=20, gamma=0.5, verbose=True)
+
     for epoch in range(args.score_network_epochs):
         train_loss = 0.
         num_docs = 0
@@ -323,10 +331,11 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, d
             if step % 5 == 0 and step > 0:
                 print('Epoch: %d :: Step: %d, Loss: %.2f' % (epoch, step, cur_loss), end='\r')
 
-            # Move model back to CPU so that it doesn't hog GPU
-            # memory as it will not be removed from the context.
-            model.to(device=torch.device("cpu"))
-            distances.to(device=torch.device("cpu"))
+            if not args.on_device:
+                # Move model back to CPU so that it doesn't hog GPU
+                # memory as it will not be removed from the context.
+                model.to(device=torch.device("cpu"))
+                distances.to(device=torch.device("cpu"))
 
         if min_train_loss < cur_loss:
             patience_counter += 1
@@ -338,7 +347,8 @@ def train_score_network(buffers, model, phi_network, phi_optimizer, tokenizer, d
         if patience_counter > args.train_score_patience:
             logging.info(f"Stopping Early at epoch: {epoch} with minimum loss: {min_train_loss}")
             break
-        
+            
+        scheduler.step()
         train_score_network_end = timer()
         train_score_network_time['cuml'] += train_score_network_end - train_score_network_start
         train_score_network_time['tick'] += 1
@@ -488,7 +498,7 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer,
 
     ggs_update_start = timer()
     # -- Perform update
-    ggs_utils.update(model, update_directions, optimizer, args.max_grad_norm)
+    MODEL_ID = ggs_utils.update(model, update_directions, optimizer, args.max_grad_norm)
     ggs_update_end = timer()
     ggs_update_time['cuml'] += ggs_update_end - ggs_update_start
     ggs_update_time['tick'] += 1
@@ -543,6 +553,9 @@ class MLP(nn.Module):
 
 
 def train(model, tokenizer, dataset_tensor_dict, args, device):
+
+    MODEL_ID = ggs_utils.get_model_id(model)
+
     model.train()
     train_sampler = RandomSampler(dataset_tensor_dict['train'])
     train_dataloader = DataLoader(
@@ -558,8 +571,6 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     if args.efficient:
         config = GPT2Config()
         phi_network = MLP(input_size=config.hidden_size).to(device=device)
-        phi_optimizer = optim.Adam(phi_network.parameters())
-
         buffer = RingBuffer(max_size=args.max_buffer_size, 
                     persistence='none',
                     persistent_file_path=os.path.join(args.save_base_dir,
@@ -570,7 +581,6 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
     else:
         phi_network = None
-        phi_optimizer = None
 
         scoring_function = partial(original_mgs_scoring_function, buffer)
 
@@ -584,12 +594,13 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     if args.efficient:
         print('=' * 150)
         print("Started Initial Data Aggregation.")
-        for step, batch in enumerate(train_dataloader):
+        for step, (batch_id, batch) in enumerate(train_dataloader):
             if step >= args.initial_train_data_size:
                 break
 
             aggregate_step_start = timer()
-            aggregate_score_data(step,
+            aggregate_score_data(step, 
+                                    batch_id,
                                     batch, 
                                     buffer,
                                     model, 
@@ -612,7 +623,6 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         train_score_network(buffer, 
                             model, 
                             phi_network, 
-                            phi_optimizer,
                             tokenizer, 
                             device,
                             args)
@@ -621,10 +631,11 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
     for epoch_number in range(args.num_train_epochs):
         metrics = GuidedMetrics()
 
-        for step, batch in enumerate(train_dataloader):
+        for step, (batch_id, batch) in enumerate(train_dataloader):
             if args.efficient:
                 if shall_aggregate_data(step, total_num_batches, args):
                     aggregate_score_data(step,
+                                            batch_id,
                                             batch, 
                                             buffer,
                                             model, 
@@ -638,7 +649,6 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                     train_score_network(buffer, 
                                         model, 
                                         phi_network, 
-                                        phi_optimizer, 
                                         tokenizer,
                                         device,
                                         args)
