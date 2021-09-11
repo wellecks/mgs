@@ -71,15 +71,46 @@ else
 
         if [ -n "${efficient}" ]; 
         then
-            cmd+=" --efficient  --log-scoring-function "
+            cmd+=" --efficient  --log-scoring-function  --on-device"
 						if [ -n "${debug}" ];
 						then
-							cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 10 --retrain-score-network-every 100 --max-buffer-size 80'
-							# cmd+=' --plot-times --score-network-epochs 100 --initial-train-data-size 300 --retrain-score-network-every 100 --max-buffer-size 600'
+							cmd+=' --plot-times --score-network-epochs 100 --aggregated-data-size 10 --retrain-score-network-every 100 --max-buffer-size 80 --on-device'
+							# cmd+=' --plot-times --score-network-epochs 50 --aggregated-data-size 300 --retrain-score-network-every 200 --max-buffer-size 600 '
+						fi
+
+						if [ -n "${use_agg_data}" ];
+						then
+							if [ -z "${agg_data}" ];
+							then
+								echo "To use aggregated data, agg_data filepath is needed."
+								exit;
+							fi
+							cmd+=" --use-saved-aggregated-data --aggregated-data-path ${agg_data} "
+						fi
+
+						if [ -n "${save_agg_data}" ];
+						then
+							cmd+=" --save-aggregated-data "
+						fi
+
+						if [ -n "${use_score_network}" ];
+						then
+							if [ -z "${score_network}" ];
+							then
+								echo "To use saved score network, score_network filepath is needed."
+								exit;
+							fi
+							cmd+=" --use-saved-score-network --score-network-file ${score_network} "
+						fi
+
+						if [ -n "${save_score_network}" ];
+						then
+							cmd+=" --save-score-network "
 						fi
         fi
 	else
 		echo "Input Is Error."
+		exit
 	fi
 fi
 TMP_RUN_DIR=${SLURM_TMPDIR}/${OUTPUT_DIR_SUFFIX}

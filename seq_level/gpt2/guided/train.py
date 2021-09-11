@@ -91,6 +91,7 @@ class RingBuffer:
             self.db_counter[batch_key] = 0
         self.db_counter[batch_key] += 1
 
+        global MODEL_ID
         model_key = f"model_{MODEL_ID}"
         if model_key not in self.db:
             if not self.on_device:
@@ -359,14 +360,11 @@ def train_score_network(buffers, model, phi_network, tokenizer, device, args):
     print('=' * 150)
     phi_network = best_phi_network
 
-def original_mgs_scoring_function(buffer, model, tokenizer, batch, score_model, max_length, device, args, prefix):
+def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args, prefix):
     decoded = defaultdict(list)
     bpes_curr, outputs, distance_curr = ggs_utils.decode_and_distance(
                                                      model, tokenizer, batch, score_model, 
                                                      max_length, device, args, average_distance=False)
-
-    # buffer.append(args.log_step, prefix, batch, model,
-    #                     outputs, distance_curr)
 
     for i, idxs in enumerate(bpes_curr):
         decoded[f'{prefix}_{i}'].append(tokenizer.decode(idxs))
@@ -498,6 +496,7 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer,
 
     ggs_update_start = timer()
     # -- Perform update
+    global MODEL_ID
     MODEL_ID = ggs_utils.update(model, update_directions, optimizer, args.max_grad_norm)
     ggs_update_end = timer()
     ggs_update_time['cuml'] += ggs_update_end - ggs_update_start
@@ -553,7 +552,7 @@ class MLP(nn.Module):
 
 
 def train(model, tokenizer, dataset_tensor_dict, args, device):
-
+    global MODEL_ID
     MODEL_ID = ggs_utils.get_model_id(model)
 
     model.train()
@@ -563,69 +562,94 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         sampler=train_sampler,
         batch_size=1
     )
-    
 
     total_num_batches = len(train_dataloader)
     optimizer, scheduler = utils.get_optimizer(model, total_num_batches, args)
-
-    if args.efficient:
-        config = GPT2Config()
-        phi_network = MLP(input_size=config.hidden_size).to(device=device)
-        buffer = RingBuffer(max_size=args.max_buffer_size, 
-                    persistence='none',
-                    persistent_file_path=os.path.join(args.save_base_dir,
-                                                "persistence_datastore"), 
-                    on_device=args.on_device)
-
-        scoring_function = partial(dagger_mgs_scoring_function, phi_network)
-
-    else:
-        phi_network = None
-
-        scoring_function = partial(original_mgs_scoring_function, buffer)
-
     best_val_loss = 10000
     patience = args.patience
     stats_cache = defaultdict(list)
     average_times = {}
     score_model = deepcopy(model)
+    scoring_function = original_mgs_scoring_function
 
-    # Initialize buffer and pretrain score network.
+    config = GPT2Config()
+    phi_network = MLP(input_size=config.hidden_size).to(device=device)
+
     if args.efficient:
+        # Initialize buffer and pretrain score network.
         print('=' * 150)
-        print("Started Initial Data Aggregation.")
-        for step, (batch_id, batch) in enumerate(train_dataloader):
-            if step >= args.initial_train_data_size:
-                break
+        buffer = RingBuffer(max_size=args.max_buffer_size, 
+                    persistence='none',
+                    persistent_file_path=os.path.join(
+                                            args.save_base_dir,
+                                            "persistence_datastore"), 
+                    on_device=args.on_device)
 
-            aggregate_step_start = timer()
-            aggregate_score_data(step, 
-                                    batch_id,
-                                    batch, 
-                                    buffer,
-                                    model, 
-                                    score_model, 
-                                    tokenizer, 
-                                    args, 
-                                    device)
 
-            aggregate_step_end = timer()
-            aggregation_step_time['cuml'] += aggregate_step_end - aggregate_step_start
-            aggregation_step_time['tick'] += 1
-            if step % args.print_every == 0:
-                logging.info(f"Aggregated Batches:  {step}/{total_num_batches}." +
-                   f"Avg time: {aggregation_step_time['cuml']/aggregation_step_time['tick']}")
-        print()
+        # If using saved score network, use it, else accumulate training data, 
+        # and train network on the accumulated data.
+        if args.use_saved_score_network:
+            score_model_checkpoint = torch.load(args.score_network_file)
+            phi_network.load_state_dict(score_model_checkpoint['model_save_dict'])
+            epochs_trained = score_model_checkpoint['epochs']
+            logging.info(f"Loading Phi Network trained for {epochs_trained} epochs from {args.score_network_file}.")
+        else:
+            # If using saved aggregated data, use it, else, initialize an empty buffer.
+            if args.use_saved_aggregated_data:
+                with open(args.aggregated_data_path, 'rb') as aggregated_datafile:
+                    buffer = pickle.load(aggregated_datafile)
+                logging.info(f"Loading Aggregated data from {args.aggregated_data_path}. Size: {len(buffer)}")
+            else:
+                logging.info("Started Initial Data Aggregation.")
+                for step, (batch_id, batch) in enumerate(train_dataloader):
+                    if step >= args.aggregated_data_size:
+                        break
 
-        logging.info(f"Aggregated: {step * 2} items in {aggregation_step_time['cuml']} seconds.")
+                    aggregate_step_start = timer()
+                    aggregate_score_data(step, 
+                                            batch_id,
+                                            batch, 
+                                            buffer,
+                                            model, 
+                                            score_model, 
+                                            tokenizer, 
+                                            args, 
+                                            device)
+
+                    aggregate_step_end = timer()
+                    aggregation_step_time['cuml'] += aggregate_step_end - aggregate_step_start
+                    aggregation_step_time['tick'] += 1
+                    if step % args.print_every == 0:
+                        logging.info(f"Aggregated Batches:  {step}/{total_num_batches}." +
+                        f"Avg time: {aggregation_step_time['cuml']/aggregation_step_time['tick']}")
+
+                logging.info(f"Aggregated: {step * 2} items in {aggregation_step_time['cuml']} seconds.")
+
+                if args.save_aggregated_data:
+                    buffer_filepath = os.path.join(args.save_base_dir, 'buffer.pkl')
+                    logging.info(f"Saving Aggregated Data at {buffer_filepath}")
+                    with open(buffer_filepath, 'wb') as buffer_file:
+                        pickle.dump(buffer, buffer_file)
+
+            logging.info("Training Scoring Network on Aggregated Data.")
+
+            train_score_network(buffer, 
+                                model, 
+                                phi_network, 
+                                tokenizer, 
+                                device,
+                                args)
+
+            if args.save_score_network:
+                score_network_filepath = os.path.join(args.save_base_dir, 'score_network.pkl')
+                torch.save({
+                    'model_save_dict': phi_network.state_dict(),
+                    'epochs': args.score_network_epochs,
+                    'dataset_size': len(buffer),
+                }, score_network_filepath)
+
+        scoring_function = partial(dagger_mgs_scoring_function, phi_network)
         print('=' * 150)
-
-        train_score_network(buffer, 
-                            model, 
-                            phi_network, 
-                            tokenizer, 
-                            device,
-                            args)
 
 
     for epoch_number in range(args.num_train_epochs):
@@ -655,7 +679,6 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
             train_step_time_start = timer()
 
-
             if len(batch.shape) < 2:
                     logging.error(f"Batch has a single item and is of shape: {batch.shape}")
                     continue
@@ -678,7 +701,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                           metrics=metrics,
                           optimizer=optimizer,
                           scoring_function=scoring_function,
-                          target_scoring_func=partial(original_mgs_scoring_function, buffer)
+                          target_scoring_func=original_mgs_scoring_function
                          )
             train_step_time_end = timer()
 
@@ -784,20 +807,43 @@ def add_args(parser):
     parser.add_argument(
         "--max-train-steps", type=int, default=-1
     )
+
     parser.add_argument(
-        "--retrain-score-network-every", type=int, default=300
+        "--aggregated-data-size", type=int, default=2000,
     )
     parser.add_argument(
-        "--initial-train-data-size", type=int, default=1000,
+        "--aggregated-data-path", type=str,
     )
+    parser.add_argument(
+        "--save-aggregated-data", action='store_true',
+    )
+    parser.add_argument(
+        "--use-saved-aggregated-data", action='store_true',
+    )
+
     parser.add_argument('--include-mle-gradient', action='store_true')
 
     parser.add_argument(
-        "--max-buffer-size", type=int, default=2000,
+        "--max-buffer-size", type=int, default=4000,
     )
+
+
     parser.add_argument(
         "--score-network-epochs", type=int, default=100,
     )
+    parser.add_argument(
+        "--retrain-score-network-every", type=int, default=500
+    )
+    parser.add_argument(
+        "--use-saved-score-network", action='store_true',
+    )
+    parser.add_argument(
+        "--score-network-file", type=str,
+    )
+    parser.add_argument(
+        "--save-score-network", action='store_true',
+    )
+
     parser.add_argument('--efficient', action='store_true')
     
     parser.add_argument('--plot-times', action='store_true')
