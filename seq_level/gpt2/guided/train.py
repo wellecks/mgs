@@ -360,6 +360,15 @@ def train_score_network(buffers, model, phi_network, tokenizer, device, args):
     print('=' * 150)
     phi_network = best_phi_network
 
+    if args.save_score_network:
+        score_network_filepath = os.path.join(args.save_base_dir, 
+                                                'score_network.pkl')
+        torch.save({
+            'model_save_dict': phi_network.state_dict(),
+            'epochs': epoch,
+            'dataset_size': len(buffers),
+        }, score_network_filepath)
+
 def original_mgs_scoring_function(model, tokenizer, batch, score_model, max_length, device, args, prefix):
     decoded = defaultdict(list)
     bpes_curr, outputs, distance_curr = ggs_utils.decode_and_distance(
@@ -639,14 +648,6 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                                 tokenizer, 
                                 device,
                                 args)
-
-            if args.save_score_network:
-                score_network_filepath = os.path.join(args.save_base_dir, 'score_network.pkl')
-                torch.save({
-                    'model_save_dict': phi_network.state_dict(),
-                    'epochs': args.score_network_epochs,
-                    'dataset_size': len(buffer),
-                }, score_network_filepath)
 
         scoring_function = partial(dagger_mgs_scoring_function, phi_network)
         print('=' * 150)
