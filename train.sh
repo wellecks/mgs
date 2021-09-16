@@ -69,16 +69,16 @@ else
             cmd+=" --include-mle-gradient "
         fi
 
-        if [ -n "${efficient}" ]; 
+        if [ -n "${efficient}" ] && [ "${efficient}" == "true" ]; 
         then
             cmd+=" --efficient  --log-scoring-function  --on-device"
-						if [ -n "${debug}" ];
+						if [ -n "${debug}" ] && [ "${debug}" == "true" ];
 						then
-							cmd+=' --plot-times --score-network-epochs 100 --aggregated-data-size 10 --retrain-score-network-every 100 --max-buffer-size 80 --on-device'
-							# cmd+=' --plot-times --score-network-epochs 50 --aggregated-data-size 300 --retrain-score-network-every 200 --max-buffer-size 600 '
+							# cmd+=' --score-network-epochs 100 --aggregated-data-size 10 --retrain-score-network-every 100 --max-buffer-size 80 --on-device'
+							cmd+=' --score-network-epochs 50 --aggregated-data-size 300 --retrain-score-network-every 200 --max-buffer-size 600 '
 						fi
 
-						if [ -n "${use_agg_data}" ];
+						if [ -n "${use_agg_data}" ] && [ "${use_agg_data}" == "true" ];
 						then
 							if [ -z "${agg_data}" ];
 							then
@@ -88,12 +88,12 @@ else
 							cmd+=" --use-saved-aggregated-data --aggregated-data-path ${agg_data} "
 						fi
 
-						if [ -n "${save_agg_data}" ];
+						if [ -n "${save_agg_data}" ] && [ "${save_agg_data}" == "true" ];
 						then
 							cmd+=" --save-aggregated-data "
 						fi
 
-						if [ -n "${use_score_network}" ];
+						if [ -n "${use_score_network}" ] && [ "${use_score_network}" == "true" ];
 						then
 							if [ -z "${score_network}" ];
 							then
@@ -103,7 +103,7 @@ else
 							cmd+=" --use-saved-score-network --score-network-file ${score_network} "
 						fi
 
-						if [ -n "${save_score_network}" ];
+						if [ -n "${save_score_network}" ] && [ "${save_score_network}" == "true" ];
 						then
 							cmd+=" --save-score-network "
 						fi
