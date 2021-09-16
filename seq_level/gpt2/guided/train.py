@@ -12,11 +12,9 @@ import seq_level.gpt2.train as train_utils
 import os
 from functools import partial
 from seq_level.gpt2.guided.metrics import GuidedMetrics
-from concurrent.futures import ThreadPoolExecutor
 
 from timeit import default_timer as timer
 import pandas as pd
-import collections
 import random
 import shelve
 import hashlib
@@ -24,16 +22,21 @@ import pickle
 import logging
 import math
 
+
 def _hash_tensor(obj):
     return hashlib.sha1(bytes(obj.cpu().numpy())).hexdigest()
+
 
 def _hash_model(model):
     return hashlib.sha1(next(model.parameters()).detach().cpu().numpy()).hexdigest()
 
+
 MODEL_ID = None
 
+
 class RingBuffer:
-    def __init__(self, max_size=1000, persistence='none', persistent_file_path=None, shuffle=True, iter_device=None, on_device=False):
+    def __init__(self, max_size=1000, persistence='none', persistent_file_path=None, shuffle=True, iter_device=None,
+                 on_device=False):
         self.max_size = max_size
         self.persistence = persistence
         self.queue = []
@@ -52,20 +55,20 @@ class RingBuffer:
 
     def __len__(self):
         return len(self.queue)
-    
-    def append(self, idx, type, batch_id, batch, model, 
-                sequences, distances, rng_state=None):
 
-        print(f"Id: {idx}::" + 
-               f" Queue Size: {len(self.queue)}," + 
-               f" DB size: {len(self.db)}", end='\r')
-    
+    def append(self, idx, type, batch_id, batch, model,
+               sequences, distances, rng_state=None):
+
+        print(f"Id: {idx}::" +
+              f" Queue Size: {len(self.queue)}," +
+              f" DB size: {len(self.db)}", end='\r')
+
         if len(self.queue) >= self.max_size:
-            (_, _, old_batch_key, old_model_key, 
-                old_sequences_key, old_distances, _) = self.queue.pop(0)
-            logging.debug("Removing item from Queue: " + 
-                           f"Batch: {old_batch_key} " + 
-                           f"Model: {old_model_key}.")
+            (_, _, old_batch_key, old_model_key,
+             old_sequences_key, old_distances, _) = self.queue.pop(0)
+            logging.debug("Removing item from Queue: " +
+                          f"Batch: {old_batch_key} " +
+                          f"Model: {old_model_key}.")
 
             self.db_counter[old_model_key] -= 1
             if self.db_counter[old_model_key] == 0:
@@ -109,8 +112,8 @@ class RingBuffer:
         sequences_key = None
 
         self.queue.append((idx, type, batch_key,
-                            model_key, sequences_key,
-                            distances.cpu(), rng_state))
+                           model_key, sequences_key,
+                           distances.cpu(), rng_state))
 
     def get_iterators(self, train_prop=0.8, shuffle=True):
         iterable = self.queue
@@ -131,12 +134,14 @@ class RingBuffer:
                 model = self.db[model_key]
 
                 if distances.size(0) != batch.size(0):
-                    logging.error(f"Distance: {distances.size(0)}, Batch: ({batch.size()}), {batch_key} Sequence: {sequences_key}" + \
-                            f"Model: {model_key}.")
+                    logging.error(
+                        f"Distance: {distances.size(0)}, Batch: ({batch.size()}), {batch_key} Sequence: {sequences_key}" + \
+                        f"Model: {model_key}.")
                     continue
                 yield (idx, type, batch, model, sequences, distances, rng_state)
 
         return _batch_generator(train, shuffle), _batch_generator(valid, shuffle)
+
 
 total_scoring_time = {
     "cuml": 0,
@@ -189,17 +194,16 @@ total_train_step_time = {
     "tick": 0,
 }
 
-
 train_score_network_time = {
     'cuml': 0,
     'tick': 0,
 }
 
-
 aggregation_step_time = {
     'cuml': 0,
     'tick': 0,
 }
+
 
 def aggregate_score_data(step, batch_id, batch, buffer, model, score_model, tokenizer, args, device):
     """ This method does a forward pass over the original model and 
@@ -210,14 +214,17 @@ def aggregate_score_data(step, batch_id, batch, buffer, model, score_model, toke
 
         It returns a set of tuples with each tuple of the form (x_i, y_i, yo_i, yp_i, \Delta).
     """
-    batch.squeeze_(0)
+    batch = batch.squeeze(0)
     batch = batch.to(device=device)
+
     if batch.size(1) < args.context_length + 1:
-        logging.error(f"Batch at step: {step} has sequences: {batch.size(1)} shorter than the context length: {args.context_length}")
+        logging.error(
+            f'Batch at step: {step} has sequences: {batch.size(1)} '
+            f'shorter than the context length: {args.context_length}')
         return buffer
 
-    inp, target = batch[:, :-1], batch[:, 1:]
-    max_length = ggs_utils.max_length(target, tokenizer.eos_token_id, args)
+    max_length = ggs_utils.max_length(batch[:, 1:], tokenizer.eos_token_id, args)
+
     model = model.to(device=device)
     model.eval()
     _, cur_decodings, cur_distances = ggs_utils.decode_and_distance(
@@ -232,26 +239,27 @@ def aggregate_score_data(step, batch_id, batch, buffer, model, score_model, toke
     _, per_decodings, per_distances = ggs_utils.decode_and_distance(
         per_model, tokenizer, batch, score_model, max_length, device, args, average_distance=False
     )
-    buffer.append(step, 'pertubed', batch_id, batch, model, per_decodings, per_distances, rng_state=rng_state)
+    buffer.append(step, 'perturbed', batch_id, batch, model, per_decodings, per_distances, rng_state=rng_state)
     return buffer
 
 
-def perturb(model, batch, step,  tokenizer, args,rng_state=None, device=None):
+def perturb(model, batch, step, tokenizer, args, rng_state=None, device=None):
     per_model = deepcopy(model)
-    inp, target = batch[:, :-1], batch[:, 1:]
+    inputs, targets = batch[:, :-1], batch[:, 1:]
 
     if step % 2 == 0:
         model_with_grad, _ = ggs_utils.mle_grad(
-            per_model, inp, target, tokenizer.pad_token_id, args.max_grad_norm
+            per_model, inputs, targets, tokenizer.pad_token_id, args.max_grad_norm
         )
         model_with_grad_param_dict = dict(model_with_grad.named_parameters())
-    
+
     with ggs_utils.RNG(rng_state, device) as (rng, rng_state):
         for name, param in per_model.named_parameters():
             perturbation = torch.randn(param.size(), generator=rng, device=param.device)
 
             if args.noise_scale == 'uniform':
-                noise_ = args.ggs_noise * perturbation *  args.learning_rate * (param.data.abs().sum() / param.data.numel())
+                noise_ = args.ggs_noise * perturbation * args.learning_rate * (
+                            param.data.abs().sum() / param.data.numel())
             else:
                 noise_ = args.ggs_noise * perturbation
 
@@ -268,6 +276,7 @@ def perturb(model, batch, step,  tokenizer, args,rng_state=None, device=None):
             param.data = param.data + epsilon
     return per_model, rng_state
 
+
 def get_train_score_network_loss(idx, type, model, batch, distances, phi_network, tokenizer, device):
     model = model.to(device=device)
     model.eval()
@@ -280,9 +289,9 @@ def get_train_score_network_loss(idx, type, model, batch, distances, phi_network
     batch_ = deepcopy(batch).to(device=device)
     batch_[batch == pad] = 0
 
-    model_output = model(batch_, 
-                            attention_mask=mask,
-                            output_hidden_states=True)
+    model_output = model(batch_,
+                         attention_mask=mask,
+                         output_hidden_states=True)
 
     emb = model_output.hidden_states[-1][:, -1, :].detach()
     outputs = phi_network(emb)
@@ -306,21 +315,22 @@ def validate_score_network(validation_iterator, phi_network, tokenizer, device, 
         if type == "pertubed":
             model, _ = perturb(model, batch, idx, tokenizer, args, rng_state=rng_state, device=device)
 
-        loss = get_train_score_network_loss(idx, type, model, batch, 
-                    distances, phi_network, tokenizer, device)
+        loss = get_train_score_network_loss(idx, type, model, batch,
+                                            distances, phi_network, tokenizer, device)
 
         if loss < 0:
             continue
 
         cuml_valid_loss += loss.item()
         num_docs += batch.size(0)
-        
+
         if step % 5 == 0 and step > 0:
-            print('Validation:: Step: %d, Loss: %.2f' 
-                    % (step, cuml_valid_loss / num_docs), end='\r')
+            print('Validation:: Step: %d, Loss: %.2f'
+                  % (step, cuml_valid_loss / num_docs), end='\r')
 
     print()
-    return cuml_valid_loss/num_docs
+    return cuml_valid_loss / num_docs
+
 
 def train_score_network(buffers, phi_network, tokenizer, device, args):
     """ This method takes in the scoring data (B) and learns a parameterized scoring model (S) to 
@@ -353,18 +363,17 @@ def train_score_network(buffers, phi_network, tokenizer, device, args):
             if type == "pertubed":
                 model, _ = perturb(model, batch, idx, tokenizer, args, rng_state=rng_state, device=device)
 
-
-            loss = get_train_score_network_loss(idx, type, model, batch, 
-                        distances, phi_network, tokenizer, device)
+            loss = get_train_score_network_loss(idx, type, model, batch,
+                                                distances, phi_network, tokenizer, device)
             cuml_train_loss += loss.item()
             num_docs += batch.size(0)
 
             loss.backward()
             phi_optimizer.step()
 
-
             if step % 5 == 0 and step > 0:
-                print('Training:: Epoch: %d :: Step: %d, Loss: %.2f' % (epoch, step, cuml_train_loss / num_docs), end='\r')
+                print('Training:: Epoch: %d :: Step: %d, Loss: %.2f' % (epoch, step, cuml_train_loss / num_docs),
+                      end='\r')
 
             if not args.on_device:
                 # Move model back to CPU so that it doesn't hog GPU
@@ -373,7 +382,7 @@ def train_score_network(buffers, phi_network, tokenizer, device, args):
                 distances.to(device=torch.device("cpu"))
 
         print()
-        train_loss = cuml_train_loss/num_docs
+        train_loss = cuml_train_loss / num_docs
         valid_loss = validate_score_network(valid_iterator, phi_network, tokenizer, device, args)
         if min_valid_loss < valid_loss:
             patience_counter += 1
@@ -385,38 +394,42 @@ def train_score_network(buffers, phi_network, tokenizer, device, args):
         if patience_counter > args.train_score_patience:
             logging.info(f"Stopping Early at epoch: {epoch} with best validation loss: {min_valid_loss}")
             break
-            
+
         scheduler.step()
         train_score_network_end = timer()
         train_score_network_time['cuml'] += train_score_network_end - train_score_network_start
         train_score_network_time['tick'] += 1
-        logging.info('Epoch: %d :: Train Loss: %.2f, Best Valid Loss: %.2f, Valid Loss: %.2f, Epochs Since Last Best: %d ' % (epoch, train_loss, min_valid_loss, valid_loss, patience_counter))
+        logging.info(
+            'Epoch: %d :: Train Loss: %.2f, Best Valid Loss: %.2f, Valid Loss: %.2f, Epochs Since Last Best: %d ' % (
+            epoch, train_loss, min_valid_loss, valid_loss, patience_counter))
         logging.info(f"Train score network epoch {epoch} done!")
-        logging.info(f"Avg Epoch Time: {train_score_network_time['cuml']/train_score_network_time['tick']}")
+        logging.info(f"Avg Epoch Time: {train_score_network_time['cuml'] / train_score_network_time['tick']}")
     print('Done training the score network.\n')
     print('=' * 150)
     phi_network = best_phi_network
 
     if args.save_score_network:
-        score_network_filepath = os.path.join(args.save_base_dir, 
-                                                'score_network.pkl')
+        score_network_filepath = os.path.join(args.save_base_dir,
+                                              'score_network.pkl')
         torch.save({
             'model_save_dict': phi_network.state_dict(),
             'epochs': epoch,
             'dataset_size': len(buffers),
         }, score_network_filepath)
 
-def original_mgs_scoring_function(buffer, is_target_function, model, tokenizer, batch, score_model, max_length, device, args, prefix):
+
+def original_mgs_scoring_function(buffer, is_target_function, model, tokenizer, batch, score_model, max_length, device,
+                                  args, prefix):
     decoded = defaultdict(list)
     bpes_curr, outputs, distance_curr = ggs_utils.decode_and_distance(
-                                                     model, tokenizer, batch, score_model, 
-                                                     max_length, device, args, average_distance=False)
+        model, tokenizer, batch, score_model,
+        max_length, device, args, average_distance=False)
 
     # Keeping this commented for the time being as need to figure out
     # how to integrate rng_state caching.
     if False and args.efficient and is_target:
         buffer.append(args.log_step, prefix, batch_id, batch, model,
-                        outputs, distance_curr)
+                      outputs, distance_curr)
 
     for i, idxs in enumerate(bpes_curr):
         decoded[f'{prefix}_{i}'].append(tokenizer.decode(idxs))
@@ -429,7 +442,7 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     """
     outputs = torch.tensor([])
     decoded = defaultdict(list)
-    model.eval() 
+    model.eval()
 
     pad = tokenizer.pad_token_id
     mask = batch.ne(pad).float().to(device=model.device)
@@ -437,15 +450,15 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     batch_ = batch.clone().to(device=model.device)
     batch_[batch == pad] = 0
     output = model(batch_,
-                  attention_mask=mask,
-                  output_hidden_states=True)
+                   attention_mask=mask,
+                   output_hidden_states=True)
     phi_network = phi_network.to(device=model.device)
 
     embed = output \
-              .hidden_states[-1][:, -1, :] \
-              .detach()
+                .hidden_states[-1][:, -1, :] \
+        .detach()
 
-    batched_distances = phi_network(embed).detach().cpu() 
+    batched_distances = phi_network(embed).detach().cpu()
 
     # average across batch to compute c(\theta).
     distances = batched_distances.mean(dim=0).item()
@@ -453,8 +466,8 @@ def dagger_mgs_scoring_function(phi_network, model, tokenizer, batch, score_mode
     return distances, outputs, decoded
 
 
-def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer, 
-        scoring_function, 
+def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer,
+        scoring_function,
         target_scoring_func=None):
     """ MGS algorithm parameterized to work in original as well as efficient mode.
     """
@@ -474,9 +487,9 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer,
     )
 
     if args.efficient and args.log_scoring_function and \
-       args.log_step % args.print_every == 1:
-        distance_curr_score, _, _ = target_scoring_func(model, tokenizer, batch, 
-                                score_model, max_length, device, args, prefix='original')
+            args.log_step % args.print_every == 1:
+        distance_curr_score, _, _ = target_scoring_func(model, tokenizer, batch,
+                                                        score_model, max_length, device, args, prefix='original')
         distance_comp.append(('original', distance_curr, distance_curr_score))
         logging.info(f"Distances: original: C => {distance_curr} C_t => {distance_curr_score}")
 
@@ -516,16 +529,16 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer,
     distances = []
     for i, p_model in enumerate(perturbed_models):
 
-        distance, _, decoded_samples  = scoring_function(p_model, tokenizer, batch, score_model, 
-                                                            max_length, device, args, prefix=f'preturb_{i}')
+        distance, _, decoded_samples = scoring_function(p_model, tokenizer, batch, score_model,
+                                                        max_length, device, args, prefix=f'preturb_{i}')
         if args.efficient and args.log_scoring_function and \
-            args.log_step % args.print_every == 1:
-            distance_score, _, _ = target_scoring_func(p_model, tokenizer, batch, 
-                                score_model, max_length, device, args, prefix='preturb_{i}')
+                args.log_step % args.print_every == 1:
+            distance_score, _, _ = target_scoring_func(p_model, tokenizer, batch,
+                                                       score_model, max_length, device, args, prefix='preturb_{i}')
             distance_comp.append(('preturb_{i}', distance, distance_score))
             logging.info(f"Distances: preturb_{i}: C => {distance} C_t => {distance_score}")
-            logging.info(f"C'_{i} - C: => {distance - distance_curr} C'_t_{i} - C_t => {distance_score - distance_curr_score}")
-
+            logging.info(
+                f"C'_{i} - C: => {distance - distance_curr} C'_t_{i} - C_t => {distance_score - distance_curr_score}")
 
         distances.append(distance)
         decoded.update(decoded_samples)
@@ -573,32 +586,34 @@ def MGS(batch, model, score_model, tokenizer, args, device, metrics, optimizer,
     total_mgs_time['tick'] += 1
     return decoded
 
+
 def shall_aggregate_data(step, total_num_batches, args):
     # For first 25% of batches, aggregate data every batch.
-    if step < total_num_batches//4: 
+    if step < total_num_batches // 4:
         return True
-    
+
     # For best 25% of the batches, aggregate data every alternate batch.
-    if step < total_num_batches//2 and step % 2 == 0:
+    if step < total_num_batches // 2 and step % 2 == 0:
         return True
-    
+
     # For last 50% of the batches, sample every fourth batch.
     if step % 4 == 0:
         return True
-    
+
     return False
-    
+
 
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_size=1024):
         super(MLP, self).__init__()
 
         self.fc = nn.Sequential(
-                        nn.Linear(input_size, hidden_size), 
-                        nn.ReLU(), 
-                        nn.Linear(hidden_size, hidden_size),
-                        nn.ReLU(),
-                        nn.Linear(hidden_size, 1))
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
 
     def forward(self, x):
         output = self.fc(x)
@@ -639,12 +654,12 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                 buffer = pickle.load(aggregated_datafile)
             logging.info(f"Loading Aggregated data from {args.aggregated_data_path}. Size: {len(buffer)}")
         else:
-            buffer = RingBuffer(max_size=args.max_buffer_size, 
-                        persistence='none',
-                        persistent_file_path=os.path.join(
-                                                args.save_base_dir,
-                                                "persistence_datastore"), 
-                        on_device=args.on_device)
+            buffer = RingBuffer(max_size=args.max_buffer_size,
+                                persistence='none',
+                                persistent_file_path=os.path.join(
+                                    args.save_base_dir,
+                                    "persistence_datastore"),
+                                on_device=args.on_device)
 
         # If using saved score network, use it, else accumulate training data, 
         # and train network on the accumulated data.
@@ -656,27 +671,29 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
         else:
             if not args.use_saved_aggregated_data:
                 logging.info("Started Initial Data Aggregation.")
+
                 for step, (batch_id, batch) in enumerate(train_dataloader):
+
                     if step >= args.aggregated_data_size:
                         break
 
                     aggregate_step_start = timer()
-                    aggregate_score_data(step, 
-                                            batch_id,
-                                            batch, 
-                                            buffer,
-                                            model, 
-                                            score_model, 
-                                            tokenizer, 
-                                            args, 
-                                            device)
+                    aggregate_score_data(step,
+                                         batch_id,
+                                         batch,
+                                         buffer,
+                                         model,
+                                         score_model,
+                                         tokenizer,
+                                         args,
+                                         device)
 
                     aggregate_step_end = timer()
                     aggregation_step_time['cuml'] += aggregate_step_end - aggregate_step_start
                     aggregation_step_time['tick'] += 1
                     if step % args.print_every == 0:
                         logging.info(f"Aggregated Batches:  {step}/{total_num_batches}." +
-                        f"Avg time: {aggregation_step_time['cuml']/aggregation_step_time['tick']}")
+                                     f"Avg time: {aggregation_step_time['cuml'] / aggregation_step_time['tick']}")
 
                 logging.info(f"Aggregated: {step * 2} items in {aggregation_step_time['cuml']} seconds.")
 
@@ -688,9 +705,9 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
             logging.info("Training Scoring Network on Aggregated Data.")
 
-            train_score_network(buffer, 
-                                phi_network, 
-                                tokenizer, 
+            train_score_network(buffer,
+                                phi_network,
+                                tokenizer,
                                 device,
                                 args)
 
@@ -709,19 +726,18 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
             if args.efficient:
                 if shall_aggregate_data(step, total_num_batches, args):
                     aggregate_score_data(step,
-                                            batch_id,
-                                            batch, 
-                                            buffer,
-                                            model, 
-                                            score_model, 
-                                            tokenizer, 
-                                            args, 
-                                            device)
-
+                                         batch_id,
+                                         batch,
+                                         buffer,
+                                         model,
+                                         score_model,
+                                         tokenizer,
+                                         args,
+                                         device)
 
                 if (step + 1) % args.retrain_score_network_every == 0:
-                    train_score_network(buffer, 
-                                        phi_network, 
+                    train_score_network(buffer,
+                                        phi_network,
                                         tokenizer,
                                         device,
                                         args)
@@ -729,14 +745,15 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
             train_step_time_start = timer()
 
             if len(batch.shape) < 2:
-                    logging.error(f"Batch has a single item and is of shape: {batch.shape}")
-                    continue
+                logging.error(f"Batch has a single item and is of shape: {batch.shape}")
+                continue
 
             if len(batch.shape) > 2:
                 batch = batch.squeeze(0)
 
             if batch.size(-1) < args.context_length + 1:
-                logging.error(f"Batch at step: {step} has sequences: {batch.size(1)} shorter than the context length: {args.context_length}")
+                logging.error(
+                    f"Batch at step: {step} has sequences: {batch.size(1)} shorter than the context length: {args.context_length}")
                 continue
 
             batch = batch.to(device=device)
@@ -751,7 +768,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                           optimizer=optimizer,
                           scoring_function=scoring_function,
                           target_scoring_func=target_scoring_func
-                         )
+                          )
             train_step_time_end = timer()
 
             total_train_step_time['cuml'] += train_step_time_end - train_step_time_start
@@ -773,22 +790,34 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
                 stats_cache['train/mle_loss'].append(metrics_['train/mle_loss'])
                 stats_cache['train/distance'].append(metrics_['train/distance'])
 
-                average_times['total_scoring_time'] = total_scoring_time['cuml']/total_scoring_time['tick']
-                average_times['curr_scoring_time'] = curr_scoring_time['cuml']/curr_scoring_time['tick']
-                average_times['mle_grad_computation_time'] = mle_grad_computation_time['cuml']/mle_grad_computation_time['tick']
-                average_times['perturb_computation_time'] = perturb_computation_time['cuml']/perturb_computation_time['tick']
-                average_times['perturb_scoring_time'] = perturb_scoring_time['cuml']/perturb_scoring_time['tick']
-                average_times['weight_computation_time'] = weight_computation_time['cuml']/weight_computation_time['tick']
-                average_times['ggs_update_time'] = ggs_update_time['cuml']/ggs_update_time['tick']
-                average_times['metrics_update_time'] = metrics_update_time['cuml']/metrics_update_time['tick']
-                average_times['total_mgs_time'] = total_mgs_time['cuml']/total_mgs_time['tick']
-                average_times['total_train_step_time'] = total_train_step_time['cuml']/total_train_step_time['tick']
+                average_times['total_scoring_time'] = total_scoring_time['cuml'] / total_scoring_time['tick']
+                average_times['curr_scoring_time'] = curr_scoring_time['cuml'] / curr_scoring_time['tick']
+                average_times['mle_grad_computation_time'] = mle_grad_computation_time['cuml'] / \
+                                                             mle_grad_computation_time['tick']
+                average_times['perturb_computation_time'] = perturb_computation_time['cuml'] / perturb_computation_time[
+                    'tick']
+                average_times['perturb_scoring_time'] = perturb_scoring_time['cuml'] / perturb_scoring_time['tick']
+                average_times['weight_computation_time'] = weight_computation_time['cuml'] / weight_computation_time[
+                    'tick']
+                average_times['ggs_update_time'] = ggs_update_time['cuml'] / ggs_update_time['tick']
+                average_times['metrics_update_time'] = metrics_update_time['cuml'] / metrics_update_time['tick']
+                average_times['total_mgs_time'] = total_mgs_time['cuml'] / total_mgs_time['tick']
+                average_times['total_train_step_time'] = total_train_step_time['cuml'] / total_train_step_time['tick']
 
                 if args.plot_times:
-                    df = pd.DataFrame.from_dict(average_times, 
-                                                orient='index', 
+                    df = pd.DataFrame.from_dict(average_times,
+                                                orient='index',
                                                 columns=['avg. time'])
                     print(df)
+
+            if step % args.print_decoding_every == 0 and step > 0:
+                cur_outputs = [
+                    output[:output.index(tokenizer.eos_token_id) + 1] if tokenizer.eos_token_id in output else output
+                    for output in decoded
+                ]
+                outputs_including_prefixes = [tokenizer.decode(cur_output) for cur_output in cur_outputs]
+
+                print(outputs_including_prefixes)
 
             if args.log_step % args.valid_every == 0:
                 val_loss, val_metrics, decodings = train_utils.valid_iteration(
@@ -876,7 +905,6 @@ def add_args(parser):
         "--max-buffer-size", type=int, default=4000,
     )
 
-
     parser.add_argument(
         "--score-network-epochs", type=int, default=100,
     )
@@ -894,7 +922,7 @@ def add_args(parser):
     )
 
     parser.add_argument('--efficient', action='store_true')
-    
+
     parser.add_argument('--plot-times', action='store_true')
 
     parser.add_argument('--log-scoring-function', action='store_true')
@@ -906,4 +934,8 @@ def add_args(parser):
     parser.add_argument(
         "--train-score-patience", type=int, default=10,
     )
+    parser.add_argument(
+        "--print_decoding_every", type=int, default=50,
+    )
+
     return parser
