@@ -248,7 +248,7 @@ def log_tensorboard(values_dict, step):
 
 def setup_tensorboard(args):
     log_directory = args.save_base_dir
-    args.log_step = 1
+    args.log_step = 0
     if not os.path.exists(log_directory):
         os.makedirs(log_directory)
     try:
