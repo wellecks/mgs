@@ -33,7 +33,7 @@ def train(model, tokenizer, dataset_tensor_dict, args, device):
 
     for epoch_number in range(args.num_train_epochs):
         metrics = GuidedMetrics()
-        for step, batch in enumerate(train_dataloader):
+        for step, (batch_id, batch) in enumerate(train_dataloader):
             batch = batch.squeeze(0)
             assert batch.size(1) >= args.context_length + 1
             inp, target = batch[:, :-1].to(device), batch[:, 1:].to(device)

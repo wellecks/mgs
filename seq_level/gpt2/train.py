@@ -28,7 +28,7 @@ def train(model, loss_func, tokenizer, dataset_tensor_dict, args, device):
         epoch_loss = 0
         epoch_ntokens = 0
 
-        for step, batch in enumerate(train_dataloader):
+        for step, (batch_id, batch) in enumerate(train_dataloader):
             batch = batch.squeeze(0)
             optimizer.zero_grad()
             batch = batch.to(device)
@@ -93,7 +93,7 @@ def valid_iteration(dataset, model, score_model, loss_func, tokenizer, device, c
     epoch_loss = 0
     epoch_ntokens = 0
     epoch_hits = 0
-    for step, batch in enumerate(tqdm_bar):
+    for step, (batch_id, batch) in enumerate(tqdm_bar):
         with torch.no_grad():
             batch = batch.squeeze(0)
             batch = batch.to(device)
@@ -128,7 +128,7 @@ def valid_iteration(dataset, model, score_model, loss_func, tokenizer, device, c
         total=len(valid_dataloader)
     )
     gen_metrics = GenerationMetrics()
-    for step, batch in enumerate(tqdm_bar):
+    for step, (batch_id, batch) in enumerate(tqdm_bar):
         batch = batch.squeeze(0)
         # skip batches with padding in the context for simplicity
         # (plus 1 to ensure a non-empty continuation)
